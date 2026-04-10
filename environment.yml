@@ -12,11 +12,13 @@ dependencies:
     - pybullet==3.2.7
     - screeninfo==0.6.1        # required by mengine for window sizing
     - scipy==1.17.1
-    - numpy==2.4.4
+    # numpy pinned to 1.x: arch 6.x wheels are compiled against numpy 1.x ABI;
+    # mixing 1.x and 2.x causes "numpy.dtype size changed" ValueError at runtime.
+    - numpy==1.26.4
     # ── RL framework ──────────────────────────────────────────────────────
     - tianshou==2.0.0
     - sensai-utils==1.6.0      # required by tianshou 2.0 highlevel API
-    - arch==7.2.0              # required by tianshou
+    - arch==6.2.0              # required by tianshou; 7.x incompatible with newer statsmodels
     - rliable==1.2.0           # evaluation / reliability metrics
     # ── Gymnasium ─────────────────────────────────────────────────────────
     - gymnasium==1.2.3

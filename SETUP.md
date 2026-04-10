@@ -109,3 +109,5 @@ True NVIDIA GeForce RTX 4090
 | `FileExistsError: log/GraspPhase1/...` | Normal on re-run; training uses `raise_error_on_dirname_collision=False` automatically |
 | `ImportError: mengine` | Run `pip install -e ~/mengine` inside the conda env |
 | W&B curves not appearing | Check you are in the correct project; curves appear after the first epoch completes |
+| `TypeError: deprecate_kwarg() missing 1 required positional argument` | `arch` 7.x is incompatible with your statsmodels version. Fix: `pip install "arch==6.2.0"` |
+| `ValueError: numpy.dtype size changed` (arch/rliable import) | numpy ABI mismatch: arch 6.x wheel was compiled against a different numpy. Fix: `pip install "numpy==1.26.4" && pip install "arch==6.2.0"` |

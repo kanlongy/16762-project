@@ -12,7 +12,17 @@ Dependencies (install once):
 import argparse
 import os
 import sys
+import types
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../mengine')))
+
+# tianshou imports rliable → arch → statsmodels.deprecate_kwarg at module load
+# time, which breaks on some machines due to statsmodels API differences.
+# We don't use rliable anywhere in training, so mock it out before importing tianshou.
+if 'rliable' not in sys.modules:
+    _rly = types.ModuleType('rliable')
+    _rly.library = types.ModuleType('rliable.library')
+    sys.modules['rliable'] = _rly
+    sys.modules['rliable.library'] = _rly.library
 
 import numpy as np
 import torch
