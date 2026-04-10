@@ -121,6 +121,13 @@ class WandbLoggerFactory(LoggerFactory):
 # ── Callbacks ─────────────────────────────────────────────────────────────────
 
 
+class NeverStopCallback(EpochStopCallback):
+    """Satisfies test_in_training=True requirement; never triggers early stop."""
+
+    def should_stop(self, mean_rewards: float, context: TrainingContext) -> bool:
+        return False
+
+
 class CheckpointCallback(EpochTrainCallback):
     """Save a dated policy snapshot every N epochs (separate from best_policy.pt)."""
 
@@ -235,11 +242,7 @@ def main():
         .with_logger_factory(WandbLoggerFactory(project=args.project))
         .with_name(args.name)
         # ── Stop callback required by test_in_training=True; never triggers ────
-        .with_epoch_stop_callback(
-            type('NeverStop', (EpochStopCallback,), {
-                'should_stop': staticmethod(lambda mean_rewards, context: False)
-            })()
-        )
+        .with_epoch_stop_callback(NeverStopCallback())
         # ── Periodic snapshot checkpoints ─────────────────────────────────────
         .with_epoch_train_callback(CheckpointCallback(every_n=args.save_every, save_dir=ckpt_dir))
     )
