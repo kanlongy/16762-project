@@ -1,0 +1,28 @@
+name: 16762
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+    # ── PyTorch (CUDA 13.0, for RTX 4090 / 5090) ──────────────────────────
+    - --index-url https://download.pytorch.org/whl/cu130
+    - torch==2.11.0
+    # ── Simulation ────────────────────────────────────────────────────────
+    - pybullet==3.2.7
+    - screeninfo==0.6.1        # required by mengine for window sizing
+    - scipy==1.17.1
+    - numpy==2.4.4
+    # ── RL framework ──────────────────────────────────────────────────────
+    - tianshou==2.0.0
+    - sensai-utils==1.6.0      # required by tianshou 2.0 highlevel API
+    - arch==7.2.0              # required by tianshou
+    - rliable==1.2.0           # evaluation / reliability metrics
+    # ── Gymnasium ─────────────────────────────────────────────────────────
+    - gymnasium==1.2.3
+    # ── Logging ───────────────────────────────────────────────────────────
+    - wandb==0.25.1
+    - tensorboard==2.20.0
+    # ── Utilities ─────────────────────────────────────────────────────────
+    - matplotlib==3.10.8
+    - pillow==12.1.1
