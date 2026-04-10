@@ -37,6 +37,7 @@ from tianshou.highlevel.experiment import ExperimentConfig, PPOExperimentBuilder
 from tianshou.highlevel.logger import LoggerFactory, TLogger
 from tianshou.highlevel.params.algorithm_params import PPOParams
 from tianshou.highlevel.trainer import (
+    EpochStopCallback,
     EpochTestCallback,
     EpochTrainCallback,
     TrainingContext,
@@ -233,7 +234,12 @@ def main():
         # every log call is forwarded to W&B immediately → clean epoch curves.
         .with_logger_factory(WandbLoggerFactory(project=args.project))
         .with_name(args.name)
-        # ── No early stopping: always run all max_epochs ──────────────────────
+        # ── Stop callback required by test_in_training=True; never triggers ────
+        .with_epoch_stop_callback(
+            type('NeverStop', (EpochStopCallback,), {
+                'should_stop': staticmethod(lambda mean_rewards, context: False)
+            })()
+        )
         # ── Periodic snapshot checkpoints ─────────────────────────────────────
         .with_epoch_train_callback(CheckpointCallback(every_n=args.save_every, save_dir=ckpt_dir))
     )

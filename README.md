@@ -32,17 +32,51 @@ All other dependencies (`gymnasium`, `tianshou`, `torch`, `mengine`) are already
 
 ## Training (sim)
 
+### Quick start (local machine)
+
 ```bash
-cd /home/ye/16762-project/grasp
+cd ~/16762-project/grasp
+wandb login   # only needed once
 
-# Login to W&B once (skip if already logged in)
-wandb login
-
-# Start training – logs to W&B project "16762-robot-rl"
-conda run -n 16762 python train_grasp.py --project 16762-robot-rl --name GraspPhase1
+python train_grasp.py --project 16762-rl --name GraspPhase1 \
+                      --record-video --video-every 10
 ```
 
-Checkpoints are saved under `log/GraspPhase1/seed_0/`.
+### Remote training via SSH (recommended: tmux)
+
+Training can take hours. Use `tmux` so the job keeps running after you close SSH.
+
+```bash
+# 1. SSH into the remote machine
+ssh <user>@<host>
+
+# 2. Create (or reattach to) a tmux session
+tmux new -s train          # first time
+# tmux attach -t train     # if session already exists
+
+# 3. Activate env and start training
+conda activate 16762
+cd ~/16762-project/grasp
+python train_grasp.py --project 16762-rl --name GraspPhase1 \
+                      --record-video --video-every 10
+
+# 4. Detach without killing the job: press Ctrl+B, then D
+#    You can now safely close the SSH connection.
+
+# 5. Re-attach later to check progress
+tmux attach -t train
+```
+
+Useful tmux commands:
+
+| Key / Command | Action |
+|---|---|
+| `Ctrl+B` then `D` | Detach (leave job running) |
+| `tmux attach -t train` | Re-attach to session |
+| `tmux ls` | List all sessions |
+| `tmux kill-session -t train` | Kill the session |
+
+Checkpoints are saved under `log/GraspPhase1/snapshots/`, best policy at `log/GraspPhase1/*/policy.pt`.
 
 ## Evaluation (sim)
 
