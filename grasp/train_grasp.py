@@ -20,9 +20,11 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../.
 # We don't use rliable anywhere in training, so mock it out before importing tianshou.
 if 'rliable' not in sys.modules:
     _rly = types.ModuleType('rliable')
-    _rly.library = types.ModuleType('rliable.library')
-    sys.modules['rliable'] = _rly
-    sys.modules['rliable.library'] = _rly.library
+    _rly.library    = types.ModuleType('rliable.library')
+    _rly.plot_utils = types.ModuleType('rliable.plot_utils')
+    sys.modules['rliable']            = _rly
+    sys.modules['rliable.library']    = _rly.library
+    sys.modules['rliable.plot_utils'] = _rly.plot_utils
 
 import numpy as np
 import torch
