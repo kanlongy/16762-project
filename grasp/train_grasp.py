@@ -54,7 +54,7 @@ from grasp_env import GraspEnv  # registers 'GraspEnv' with gymnasium  # noqa: F
 EPOCH_STEPS = 8192   # env steps collected per epoch (across all envs)
 
 TRAINING_CONFIG = OnPolicyTrainingConfig(
-    max_epochs=1000,
+    max_epochs=300,
     epoch_num_steps=EPOCH_STEPS,
     collection_step_num_env_steps=EPOCH_STEPS,
     num_training_envs=32,
@@ -200,7 +200,10 @@ class VideoLogCallback(EpochTestCallback):
                     frames.append(frame)
                 with torch.no_grad():
                     result = policy(Batch(obs=obs[np.newaxis], info={}))
-                    action = np.asarray(result.act[0])
+                    act = result.act[0]
+                    if hasattr(act, 'cpu'):
+                        act = act.cpu()
+                    action = np.asarray(act)
                 obs, _, terminated, truncated, _ = env.step(action)
                 if terminated or truncated:
                     break

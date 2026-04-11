@@ -43,16 +43,21 @@ class GraspEnv(gym.Env):
 
     PHASE A  gripper NOT locked yet:
         r_reach   = exp(-4 * dist)              – approach shaping (max 1.0)
-        r_close   = 3.0 * closed_ratio          – only when dist < GRASP_DIST;
+        r_align   = 1.5 * exp(-40 * dz²)       – EE at object height (max 1.5);
+                                                  active within ALIGN_DIST (0.30 m);
+                                                  encourages side-approach not top-down
+        r_close   = 2.0 * closed_ratio          – only when dist < GRASP_DIST;
                                                   no reward for staying open
-    PHASE B  gripper locked:
+    PHASE B  gripper locked (requires contact at lock time — prevents empty locks):
         r_lock    = +10.0 one-time at the step the lock first triggers
-        r_contact = +3.0 if contact else -2.0   – reward holding; penalise drop
-        r_lift    = clip(obj_above / LIFT_TARGET, 0, 1) * 15  – proportional height
+        r_contact = +4.0 if contact AND obj_above > 0.02 m  (real grasp, lifting)
+                  = +0.5 if contact but object still on table (neutral)
+                  = -2.0 if no contact                        (dropped)
+        r_lift    = clip(obj_above / LIFT_TARGET, 0, 1) * 20 – proportional height
         r_success = +50 every step object stays at/above LIFT_TARGET (20 cm)
 
     Always:
-        r_step = -0.05  (time pressure; stronger than original -0.01)
+        r_step = -0.05  (time pressure)
     """
 
     metadata = {'render_modes': ['human', 'rgb_array']}
@@ -60,9 +65,10 @@ class GraspEnv(gym.Env):
     # ── Constants ─────────────────────────────────────────────────────────────
     GRIPPER_OPEN        = 0.6    # pybullet joint angle: open
     GRIPPER_CLOSE       = 0.0    # pybullet joint angle: closed
-    GRASP_DIST          = 0.15   # metres: EE must be within this to trigger lock
+    GRASP_DIST          = 0.10   # metres: EE must be within this to trigger lock (tightened from 0.15)
     GRASP_CLOSE_THRESH  = 0.25   # gripper angle below this = "closed enough" to lock
     LIFT_TARGET_M       = 0.20   # metres above table = success (20 cm)
+    ALIGN_DIST          = 0.30   # metres: height-alignment reward active within this distance
 
     # controllable_joints = [0, 1, 4, 6, 7, 8, 9, 10, 12, 13, 26, 29]
     # indices:               0  1  2  3  4  5  6   7   8   9  10  11
@@ -232,34 +238,59 @@ class GraspEnv(gym.Env):
         closed_ratio  = 1.0 - open_ratio
 
         # ── One-shot lock trigger ─────────────────────────────────────────────
+        # Require contact so the gripper must physically touch the object —
+        # prevents locking on a nearby-but-empty close.
         was_locked = self._gripper_locked
         if not self._gripper_locked:
-            if gripper_angle < self.GRASP_CLOSE_THRESH and dist < self.GRASP_DIST:
+            if gripper_angle < self.GRASP_CLOSE_THRESH and dist < self.GRASP_DIST and bool(contact):
                 self._gripper_locked = True
 
         # ── Reward ────────────────────────────────────────────────────────────
         if not self._gripper_locked:
-            # Phase A: approach shaping + reward closing when near.
-            # No reward for staying open — the old "0.5 * open_ratio" term
-            # created a local optimum just outside GRASP_DIST where staying
-            # far-and-open beat entering the close zone with an open gripper.
-            r_reach   = float(np.exp(-4.0 * dist))
-            r_close   = 3.0 * closed_ratio if dist < self.GRASP_DIST else 0.0
+            # Phase A: approach + height-alignment shaping + close-when-near.
+            r_reach = float(np.exp(-4.0 * dist))
+
+            # Height-alignment: reward EE being at the same height as the object
+            # centre so the policy learns to approach from the side rather than
+            # from above.  Active once within ALIGN_DIST.
+            height_diff = float(ee_pos[2] - obj_pos[2])
+            r_align = (1.5 * float(np.exp(-40.0 * height_diff ** 2))
+                       if dist < self.ALIGN_DIST else 0.0)
+
+            # Close-when-near: reward finger closure only when very close so
+            # the policy commits to the grasp rather than hovering half-closed.
+            r_close   = 2.0 * closed_ratio if dist < self.GRASP_DIST else 0.0
             r_lock    = 0.0
             r_contact = 0.0
             r_lift    = 0.0
             r_success = 0.0
+            reward_phase = r_reach + r_align + r_close
         else:
-            # Phase B: lifting
-            r_reach   = 0.0
-            r_close   = 0.0
-            r_lock    = 10.0 if not was_locked else 0.0     # one-time lock bonus
-            r_contact = 3.0 if contact else -2.0
-            r_lift    = float(np.clip(obj_above / self.LIFT_TARGET_M, 0.0, 1.0)) * 15.0
+            # Phase B: lifting.
+            r_reach = 0.0
+            r_align = 0.0
+            r_close = 0.0
+            r_lock  = 10.0 if not was_locked else 0.0   # one-time lock bonus
+
+            # Differentiate "contact while lifting" from "contact while pressing
+            # the object on the table" — the latter was the exploitation strategy
+            # that caused the up/down oscillation at reward ~800.
+            # * obj_above > 0.02 m  → object has left the table → real grasp
+            # * contact but still on table → neutral (don't reward, don't punish)
+            # * no contact after lock → penalise dropping
+            if contact and obj_above > 0.02:
+                r_contact = 4.0
+            elif contact:
+                r_contact = 0.5
+            else:
+                r_contact = -2.0
+
+            r_lift    = float(np.clip(obj_above / self.LIFT_TARGET_M, 0.0, 1.0)) * 20.0
             r_success = 50.0 if obj_above >= self.LIFT_TARGET_M else 0.0
+            reward_phase = r_lock + r_contact + r_lift + r_success
 
         r_step = -0.05
-        reward = r_reach + r_close + r_lock + r_contact + r_lift + r_success + r_step
+        reward = reward_phase + r_step
 
         # Episodes always run to max_episode_steps; never terminate early.
         terminated = False
