@@ -61,7 +61,7 @@ def main():
     env  = gym.make('GraspEnv', render_mode=render_mode)
     venv = DummyVectorEnv([lambda: env])
 
-    data   = torch.load(ckpt, weights_only=False)
+    data = torch.load(ckpt, weights_only=False, map_location='cpu')
     policy = data.policy if hasattr(data, 'policy') else data
     policy.eval()
 

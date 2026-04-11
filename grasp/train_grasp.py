@@ -42,7 +42,9 @@ from tianshou.highlevel.trainer import (
     EpochTrainCallback,
     TrainingContext,
 )
+import wandb as _wandb
 from tianshou.utils import WandbLogger
+from tianshou.utils.logger.logger_base import VALID_LOG_VALS_TYPE
 
 from grasp_env import GraspEnv  # registers 'GraspEnv' with gymnasium  # noqa: F401
 
@@ -80,12 +82,29 @@ PPO_PARAMS = PPOParams(
 HIDDEN_SIZES = (256, 256)
 
 
-# ── Custom W&B logger factory ─────────────────────────────────────────────────
-# LoggerFactoryDefault only passes save_interval to WandbLogger and leaves
-# training_interval=1000, update_interval=1000 (the defaults).  With only 240
-# gradient updates per epoch, update_interval=1000 means losses never appear in
-# W&B during a short run.  We set both intervals to 1 so every log call goes
-# through immediately, giving clean per-epoch curves.
+# ── Custom W&B logger ─────────────────────────────────────────────────────────
+# Root cause of missing metrics: WandbLogger.write() only writes to TensorBoard
+# and relies on sync_tensorboard=True patching to forward data to W&B. This
+# breaks when wandb's dir and the TensorBoard SummaryWriter dir are the same
+# folder: wandb's file-watcher finds the tfevents file, copies it into
+# <log_dir>/wandb/run-xxx/files/, finds the copy, copies it again, ad infinitum.
+# The recursive file loop saturates wandb's internal pipeline and no metrics
+# ever reach the dashboard (confirmed by an empty wandb-summary.json after 2h).
+#
+# Fix A: point wandb's own dir one level above log_dir so the wandb/ subfolder
+#         is not inside the TensorBoard watch tree.
+# Fix B: subclass WandbLogger and override write() to ALSO call wandb.log()
+#         directly, bypassing sync_tensorboard entirely for metric delivery.
+
+class _DirectWandbLogger(WandbLogger):
+    """WandbLogger that calls wandb.log() directly in write(), bypassing sync_tensorboard."""
+
+    def write(self, step_type: str, step: int, data: dict[str, VALID_LOG_VALS_TYPE]) -> None:
+        super().write(step_type, step, data)
+        if _wandb.run is not None:
+            scope = step_type.split("/")[0]
+            _wandb.log({f"{scope}/{k}": v for k, v in data.items()}, step=step)
+
 
 class WandbLoggerFactory(LoggerFactory):
     def __init__(self, project: str) -> None:
@@ -98,24 +117,29 @@ class WandbLoggerFactory(LoggerFactory):
         run_id: str | None,
         config_dict: dict | None = None,
     ) -> TLogger:
-        logger = WandbLogger(
-            training_interval=1,   # log every env-step call (effectively once per epoch)
+        # Fix A: wandb stores its own files one level above log_dir so the
+        # wandb/ subfolder is never inside the TensorBoard directory, preventing
+        # the infinite recursive file-copy loop.
+        wandb_dir = os.path.dirname(os.path.abspath(log_dir))
+        os.makedirs(wandb_dir, exist_ok=True)
+        logger = _DirectWandbLogger(
+            training_interval=1,
             test_interval=1,
-            update_interval=1,     # log every gradient-step call
+            update_interval=1,
             project=self._project,
             name=experiment_name.replace(os.path.sep, '__'),
             run_id=run_id,
             config=config_dict,
-            log_dir=log_dir,
+            log_dir=wandb_dir,
         )
-        # TensorBoard writer must be created AFTER wandb.init() so sync_tensorboard works
+        # TensorBoard writer must be created AFTER wandb.init()
         writer = SummaryWriter(log_dir)
         writer.add_text('config', str(config_dict))
         logger.load(writer)
         return logger
 
     def get_logger_class(self) -> type[TLogger]:
-        return WandbLogger
+        return _DirectWandbLogger
 
 
 # ── Callbacks ─────────────────────────────────────────────────────────────────

@@ -42,20 +42,17 @@ class GraspEnv(gym.Env):
     Reward (two phases):
 
     PHASE A  gripper NOT locked yet:
-        r_reach   = exp(-5 * dist)              – approach shaping
-        r_gripper = +0.5 * open_ratio           – reward staying open when far
-                  | +2.0 * progress * closed    – reward closing when near object
-        r_contact = 0
-
+        r_reach   = exp(-4 * dist)              – approach shaping (max 1.0)
+        r_close   = 3.0 * closed_ratio          – only when dist < GRASP_DIST;
+                                                  no reward for staying open
     PHASE B  gripper locked:
-        r_reach   = 0
-        r_gripper = 0
+        r_lock    = +10.0 one-time at the step the lock first triggers
         r_contact = +3.0 if contact else -2.0   – reward holding; penalise drop
-        r_lift    = clip(obj_above / LIFT_TARGET, 0, 1) * 30  – proportional height
-        r_success = +50 when object reaches LIFT_TARGET (20 cm)
+        r_lift    = clip(obj_above / LIFT_TARGET, 0, 1) * 15  – proportional height
+        r_success = +50 every step object stays at/above LIFT_TARGET (20 cm)
 
     Always:
-        r_step = -0.01
+        r_step = -0.05  (time pressure; stronger than original -0.01)
     """
 
     metadata = {'render_modes': ['human', 'rgb_array']}
@@ -235,32 +232,34 @@ class GraspEnv(gym.Env):
         closed_ratio  = 1.0 - open_ratio
 
         # ── One-shot lock trigger ─────────────────────────────────────────────
+        was_locked = self._gripper_locked
         if not self._gripper_locked:
             if gripper_angle < self.GRASP_CLOSE_THRESH and dist < self.GRASP_DIST:
                 self._gripper_locked = True
 
         # ── Reward ────────────────────────────────────────────────────────────
         if not self._gripper_locked:
-            # Phase A: approach + shape gripper
-            r_reach = float(np.exp(-5.0 * dist))
-            if dist > self.GRASP_DIST:
-                r_gripper = 0.5 * open_ratio            # stay open while far
-            else:
-                progress  = 1.0 - dist / self.GRASP_DIST
-                r_gripper = 2.0 * progress * closed_ratio  # close as you get near
+            # Phase A: approach shaping + reward closing when near.
+            # No reward for staying open — the old "0.5 * open_ratio" term
+            # created a local optimum just outside GRASP_DIST where staying
+            # far-and-open beat entering the close zone with an open gripper.
+            r_reach   = float(np.exp(-4.0 * dist))
+            r_close   = 3.0 * closed_ratio if dist < self.GRASP_DIST else 0.0
+            r_lock    = 0.0
             r_contact = 0.0
             r_lift    = 0.0
             r_success = 0.0
         else:
             # Phase B: lifting
             r_reach   = 0.0
-            r_gripper = 0.0
-            r_contact = 3.0 if contact else -2.0            # penalise dropping
-            r_lift    = float(np.clip(obj_above / self.LIFT_TARGET_M, 0.0, 1.0)) * 30.0
+            r_close   = 0.0
+            r_lock    = 10.0 if not was_locked else 0.0     # one-time lock bonus
+            r_contact = 3.0 if contact else -2.0
+            r_lift    = float(np.clip(obj_above / self.LIFT_TARGET_M, 0.0, 1.0)) * 15.0
             r_success = 50.0 if obj_above >= self.LIFT_TARGET_M else 0.0
 
-        r_step = -0.01
-        reward = r_reach + r_gripper + r_contact + r_lift + r_success + r_step
+        r_step = -0.05
+        reward = r_reach + r_close + r_lock + r_contact + r_lift + r_success + r_step
 
         # Episodes always run to max_episode_steps; never terminate early.
         terminated = False
