@@ -54,7 +54,7 @@ from grasp_env import GraspEnv  # registers 'GraspEnv' with gymnasium  # noqa: F
 EPOCH_STEPS = 8192   # env steps collected per epoch (across all envs)
 
 TRAINING_CONFIG = OnPolicyTrainingConfig(
-    max_epochs=300,
+    max_epochs=500,
     epoch_num_steps=EPOCH_STEPS,
     collection_step_num_env_steps=EPOCH_STEPS,
     num_training_envs=32,
