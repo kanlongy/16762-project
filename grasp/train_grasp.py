@@ -51,9 +51,15 @@ from grasp_env import GraspEnv  # registers 'GraspEnv' with gymnasium  # noqa: F
 
 # ── Training configuration ────────────────────────────────────────────────────
 
-EPOCH_STEPS = 8192   # env steps collected per epoch (across all envs)
+# Each epoch collects this many env steps across all parallel envs.
+# Doubled from 8192 → 16384 so each update epoch sees ~54 full episodes
+# (vs ~27 before), reducing gradient variance substantially.
+EPOCH_STEPS = 16384
 
 TRAINING_CONFIG = OnPolicyTrainingConfig(
+    # 500 epochs × 16384 steps = ~8.2M total env steps.
+    # Contact-rich grasping with a sparse success bonus typically needs 5–10M;
+    # the previous 2M budget was too low for the task to converge.
     max_epochs=500,
     epoch_num_steps=EPOCH_STEPS,
     collection_step_num_env_steps=EPOCH_STEPS,
@@ -62,15 +68,28 @@ TRAINING_CONFIG = OnPolicyTrainingConfig(
     test_in_training=True,
     buffer_size=EPOCH_STEPS,
     batch_size=512,
-    update_step_num_repetitions=15,
+    # Reduced from 15 → 8: 8 repetitions × (16384/512) = 256 gradient updates
+    # per epoch, which is already aggressive for PPO.  15 repetitions on the
+    # old 8192-step buffer caused 240 updates from nearly identical mini-batches,
+    # pushing the policy off the on-policy manifold and hurting stability.
+    update_step_num_repetitions=8,
 )
 
 PPO_PARAMS = PPOParams(
     lr=3e-4,
-    gamma=0.99,
+    # Increased from 0.99 → 0.995.  With max_episode_steps=300, a reward at
+    # the final step is discounted to 0.99^299 ≈ 0.05 at step 0 — the sparse
+    # r_success=+100 bonus is nearly invisible at the start of an episode.
+    # gamma=0.995 raises that to 0.995^299 ≈ 0.22, making long-horizon credit
+    # assignment practical without destabilising value estimation.
+    gamma=0.995,
     gae_lambda=0.95,
     eps_clip=0.2,
-    ent_coef=0.01,
+    # Increased from 0.01 → 0.02.  The bilateral-contact + lift-verify lock
+    # conditions create a narrow success funnel in a 6-D action space; extra
+    # entropy regularisation helps the policy keep exploring approach directions
+    # rather than collapsing to a single sub-optimal routine early in training.
+    ent_coef=0.02,
     vf_coef=0.5,
     max_grad_norm=0.5,
     action_bound_method='clip',
@@ -145,10 +164,25 @@ class WandbLoggerFactory(LoggerFactory):
 # ── Callbacks ─────────────────────────────────────────────────────────────────
 
 
-class NeverStopCallback(EpochStopCallback):
-    """Satisfies test_in_training=True requirement; never triggers early stop."""
+class BestRewardCallback(EpochStopCallback):
+    """Tracks best mean reward and saves policy when a new best is reached.
+
+    Satisfies the test_in_training=True requirement (never triggers early stop)
+    while also maintaining a best_reward_policy.pt that always reflects the
+    highest mean-reward checkpoint seen so far.
+    """
+
+    def __init__(self, save_dir: str) -> None:
+        self._save_dir        = save_dir
+        self._best_reward     = float('-inf')
 
     def should_stop(self, mean_rewards: float, context: TrainingContext) -> bool:
+        if mean_rewards > self._best_reward:
+            self._best_reward = mean_rewards
+            os.makedirs(self._save_dir, exist_ok=True)
+            path = os.path.join(self._save_dir, 'best_reward_policy.pt')
+            torch.save(context.algorithm, path)
+            print(f"\n[BestReward] new best {mean_rewards:.2f} → {path}")
         return False
 
 
@@ -268,8 +302,8 @@ def main():
         # every log call is forwarded to W&B immediately → clean epoch curves.
         .with_logger_factory(WandbLoggerFactory(project=args.project))
         .with_name(args.name)
-        # ── Stop callback required by test_in_training=True; never triggers ────
-        .with_epoch_stop_callback(NeverStopCallback())
+        # ── Stop callback: never stops, but saves best_reward_policy.pt ────────
+        .with_epoch_stop_callback(BestRewardCallback(save_dir=ckpt_dir))
         # ── Periodic snapshot checkpoints ─────────────────────────────────────
         .with_epoch_train_callback(CheckpointCallback(every_n=args.save_every, save_dir=ckpt_dir))
     )
@@ -288,9 +322,11 @@ def main():
     print(f"  run name     : {args.name}")
     print(f"  log dir      : {args.log_dir}")
     print(f"  train envs   : {TRAINING_CONFIG.num_training_envs}")
+    print(f"  epoch steps  : {EPOCH_STEPS}  (total ≈ {EPOCH_STEPS * TRAINING_CONFIG.max_epochs // 1_000_000:.1f}M)")
     print(f"  hidden sizes : {HIDDEN_SIZES}")
     print(f"  batch size   : {TRAINING_CONFIG.batch_size}")
     print(f"  max epochs   : {TRAINING_CONFIG.max_epochs}")
+    print(f"  gamma        : {PPO_PARAMS.gamma}  ent_coef: {PPO_PARAMS.ent_coef}")
     print(f"  snapshot every {args.save_every} epochs → {ckpt_dir}")
     print(f"  video logging: {'on (every %d epochs)' % args.video_every if args.record_video else 'off'}")
     print("=" * 60)
