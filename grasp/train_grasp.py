@@ -60,7 +60,7 @@ TRAINING_CONFIG = OnPolicyTrainingConfig(
     # 500 epochs × 16384 steps = ~8.2M total env steps.
     # Contact-rich grasping with a sparse success bonus typically needs 5–10M;
     # the previous 2M budget was too low for the task to converge.
-    max_epochs=500,
+    max_epochs=300,
     epoch_num_steps=EPOCH_STEPS,
     collection_step_num_env_steps=EPOCH_STEPS,
     num_training_envs=32,
@@ -89,7 +89,7 @@ PPO_PARAMS = PPOParams(
     # conditions create a narrow success funnel in a 6-D action space; extra
     # entropy regularisation helps the policy keep exploring approach directions
     # rather than collapsing to a single sub-optimal routine early in training.
-    ent_coef=0.02,
+    ent_coef=0.03,
     vf_coef=0.5,
     max_grad_norm=0.5,
     action_bound_method='clip',
