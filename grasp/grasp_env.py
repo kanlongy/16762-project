@@ -267,7 +267,12 @@ class GraspEnv(gym.Env):
             list(rel_pos), [0, 0, 0], list(rel_quat),
             physicsClientId=client,
         )
-        p.changeConstraint(self._grasp_constraint, maxForce=50, physicsClientId=client)
+        # Use a large maxForce so the constraint reliably holds the object during
+        # teleportation and subsequent simulation steps. 50 N proved insufficient:
+        # the arm's PD controller could outfight the constraint and let the object
+        # fall back to the table before episode start, causing spurious
+        # "instant success" episodes in Stage 2.
+        p.changeConstraint(self._grasp_constraint, maxForce=500, physicsClientId=client)
 
         # 6. NOW teleport lift joint AND object to the lifted height, then stabilise.
         #    Both are moved together so the constraint can immediately lock the
@@ -281,7 +286,19 @@ class GraspEnv(gym.Env):
             list(obj_quat0),
             physicsClientId=client,
         )
-        m.step_simulation(steps=20, realtime=False)
+        m.step_simulation(steps=40, realtime=False)
+
+        # Verify constraint held: if object slipped to near table height, force it
+        # back to the correct lifted position before the episode begins.
+        obj_check, _ = self.object.get_base_pos_orient()
+        if float(obj_check[2]) < (float(obj_pos0[2]) + self.LIFT_TARGET_M * 0.5):
+            p.resetBasePositionAndOrientation(
+                self.object.body,
+                [float(obj_pos0[0]), float(obj_pos0[1]), lifted_z],
+                list(obj_quat0),
+                physicsClientId=client,
+            )
+            m.step_simulation(steps=20, realtime=False)
 
         # 6. Set all Phase C state variables so step() starts from Phase C.
         ee_final, _  = robot.get_link_pos_orient(robot.end_effector)
@@ -594,19 +611,7 @@ class GraspEnv(gym.Env):
             else:
                 r_false = 0.0
 
-            # One-time bonus / success reward when entering Phase C (lift succeeded).
-            # Stage 1: treat lift completion as full task success (same reward as
-            # PLACE_SUCCESS so reward scales are comparable across ablation stages).
-            if self._phase_c and not self._lift_done_rewarded:
-                if self._curriculum_stage == 1:
-                    r_lift_done = self.PLACE_SUCCESS   # terminal success reward
-                else:
-                    r_lift_done = self.LIFT_DONE_BONUS
-                self._lift_done_rewarded = True
-            else:
-                r_lift_done = 0.0
-
-            reward_phase = r_lift + r_height + r_false + r_lift_done
+            reward_phase = r_lift + r_height + r_false
 
         else:
             if not self._place_descend:
@@ -622,6 +627,22 @@ class GraspEnv(gym.Env):
                 ))
                 r_place_done = self.PLACE_SUCCESS if placed else 0.0
                 reward_phase = r_descend + r_place_done
+
+        # Lift-done bonus fires exactly once at the step Phase C is entered.
+        # Previously this block lived inside `elif not self._phase_c:` with a check
+        # `if self._phase_c`, which was a logical contradiction (dead code): the outer
+        # branch is entered only when _phase_c is False, but the inner check required
+        # _phase_c to be True. Because _phase_c is set True *before* the reward block
+        # runs (lines above), the elif branch was never entered at the transition step,
+        # so neither Stage-1's +100 terminal bonus nor Full's +10 lift bonus were ever
+        # awarded. Moving the check here, outside the if-elif-else, fixes the issue.
+        if self._phase_c and not self._lift_done_rewarded:
+            if self._curriculum_stage == 1:
+                r_lift_done = self.PLACE_SUCCESS   # terminal success reward for stage 1
+            else:
+                r_lift_done = self.LIFT_DONE_BONUS
+            self._lift_done_rewarded = True
+            reward_phase += r_lift_done
 
         r_step   = -0.02
         r_action = -0.005 * float(np.sum(np.square(action_cmd)))
