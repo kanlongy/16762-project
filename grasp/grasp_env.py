@@ -18,8 +18,9 @@ class GraspEnv(gym.Env):
     may still adjust base and wrist for balance.
 
     Observation (21 dims):
-        ee_local        (3)  – EE position in robot base frame
-        diff            (3)  – obj_local - ee_local  (approach vector)
+        ee_local        (3)  – EE (fingertip midpoint) position in robot base frame
+        diff            (3)  – obj_local - ee_local  (approach vector; 0 when object
+                               is centred between the fingers at grasp depth)
         place_diff      (3)  – place_target_local - ee_local  (transport vector)
         joint_obs       (3)  – lift joint, arm_sum, wrist_yaw
         obj_above       (1)  – object height above its initial z (lift progress)
@@ -68,7 +69,19 @@ class GraspEnv(gym.Env):
     GRIPPER_CLOSE    = 0.0
 
     # Phase A (approach → grasp)
-    GRASP_DIST       = 0.12    # metres: EE within this distance triggers grasp
+    # GRASP_DIST is the radius (m) around the fingertip midpoint for the auto-grasp
+    # trigger. With the open gripper spanning ~21 cm, the previous 12 cm threshold
+    # allowed the trigger to fire even when the object was entirely outside the
+    # finger span (e.g. ~10 cm laterally off-centre). We now use 6 cm, which lies
+    # inside the half-span of an open gripper (10.5 cm) and ensures the object is
+    # between the fingers. The lateral-alignment gate below further guarantees it.
+    GRASP_DIST       = 0.06
+    # In addition to the 3-D distance check, require the object to lie within this
+    # half-width (m) of the line connecting the two fingertips before triggering
+    # auto-grasp. Mustard bottle radius ~3.5 cm + 1.5 cm margin = 5 cm. This stops
+    # the "right finger on left side of object" failure mode where the policy
+    # reduces distance but never centres the object between the fingers.
+    GRASP_LATERAL    = 0.05
     GRASP_CONFIRM    = 4       # consecutive close-enough steps to commit
 
     # Phase B (lift)
@@ -94,7 +107,20 @@ class GraspEnv(gym.Env):
     GRIP_LATERAL_FRICTION = 3.0
 
     # Gripper finger / fingertip link indices on the Stretch3 body.
-    _GRIPPER_LINKS = frozenset([26, 27, 29, 30])
+    # Stretch3 URDF link layout:
+    #   26: link_gripper_finger_right      (revolute joint, closes with gripper)
+    #   27: link_gripper_fingertip_right   (fixed to 26, tip of right finger)
+    #   29: link_gripper_finger_left       (revolute joint, closes with gripper)
+    #   30: link_gripper_fingertip_left    (fixed to 29, tip of left finger)
+    #   33: link_grasp_center              (fixed to gripper body, NOT between fingers!)
+    # The URDF's `link_grasp_center` is offset ~3.5 cm PAST the fingertip plane in
+    # the arm-extension direction. Using it as the EE reference lets the policy
+    # satisfy "minimise distance" by driving the object past the fingertips, so
+    # fingers close in front of (empty) air. We instead use the midpoint of the
+    # two fingertips (links 27 and 30) as the true grasp reference point.
+    _GRIPPER_LINKS       = frozenset([26, 27, 29, 30])
+    _FINGERTIP_R_LINK    = 27
+    _FINGERTIP_L_LINK    = 30
 
     TILT_FREE_RAD       = np.deg2rad(15.0)
     TILT_PENALTY_SCALE  = 0.3
@@ -173,8 +199,43 @@ class GraspEnv(gym.Env):
         contacts = self.robot.get_contact_points(bodyB=self.object)
         return bool(contacts and any(c['linkA'] in self._GRIPPER_LINKS for c in contacts))
 
+    def _fingertip_midpoint(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return (midpoint_world, lateral_axis_world) of the two gripper fingertips.
+
+        `midpoint_world` is the true grasp point — the geometric centre between
+        the right (link 27) and left (link 30) fingertip links. This is what the
+        reward and auto-grasp logic use, not the URDF-declared `link_grasp_center`
+        which is offset ~3.5 cm past the fingertip plane and causes the policy to
+        drive the object past the fingers.
+
+        `lateral_axis_world` is the unit vector from right to left fingertip. The
+        component of (obj - midpoint) along this axis measures how much the object
+        is shifted sideways out of the gripper span. We gate the auto-grasp on
+        this quantity so the trigger only fires with the object squarely between
+        the two fingers.
+        """
+        client = self.env.id
+        r_state = p.getLinkState(
+            self.robot.body, self._FINGERTIP_R_LINK,
+            computeForwardKinematics=True, physicsClientId=client,
+        )
+        l_state = p.getLinkState(
+            self.robot.body, self._FINGERTIP_L_LINK,
+            computeForwardKinematics=True, physicsClientId=client,
+        )
+        r_pos = np.asarray(r_state[4], dtype=np.float32)
+        l_pos = np.asarray(l_state[4], dtype=np.float32)
+        mid   = (r_pos + l_pos) * 0.5
+        axis  = l_pos - r_pos
+        norm  = float(np.linalg.norm(axis))
+        axis  = axis / norm if norm > 1e-6 else np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        return mid, axis.astype(np.float32)
+
     def _get_obs(self) -> np.ndarray:
-        ee_pos, _ = self.robot.get_link_pos_orient(self.robot.end_effector)
+        # Use the fingertip midpoint as the EE reference, not link 33 (grasp_center).
+        # See `_fingertip_midpoint` for rationale.
+        ee_pos_arr, _ = self._fingertip_midpoint()
+        ee_pos = ee_pos_arr.tolist()
         obj_pos, _ = self.object.get_base_pos_orient()
 
         ee_local,  _ = self.robot.global_to_local_coordinate_frame(ee_pos)
@@ -301,9 +362,12 @@ class GraspEnv(gym.Env):
             m.step_simulation(steps=20, realtime=False)
 
         # 6. Set all Phase C state variables so step() starts from Phase C.
-        ee_final, _  = robot.get_link_pos_orient(robot.end_effector)
-        obj_final, _ = self.object.get_base_pos_orient()
-        obj_above    = float(obj_final[2] - self._obj_init_z)
+        # Use the fingertip midpoint as the EE reference (same convention as
+        # step()'s `ee_pos`) so `_prev_place_dist` is computed on the same point
+        # the reward function will use on the next step.
+        ee_final_arr, _ = self._fingertip_midpoint()
+        obj_final, _    = self.object.get_base_pos_orient()
+        obj_above       = float(obj_final[2] - self._obj_init_z)
 
         self._gripper_locked     = True
         self._grasp_confirm      = self.GRASP_CONFIRM         # already triggered
@@ -314,7 +378,7 @@ class GraspEnv(gym.Env):
         self._prev_obj_above     = obj_above
         self._prev_dist          = 0.0  # Phase A potential not used in Phase C
         self._prev_place_dist    = float(np.linalg.norm(
-            np.array(ee_final[:2]) - self._place_target[:2]
+            ee_final_arr[:2] - self._place_target[:2]
         ))
 
     def _get_info(self) -> dict:
@@ -426,9 +490,12 @@ class GraspEnv(gym.Env):
 
         m.step_simulation(steps=20, realtime=False)
 
-        ee_pos0, _  = self.robot.get_link_pos_orient(self.robot.end_effector)
-        obj_pos0, _ = self.object.get_base_pos_orient()
-        self._prev_dist     = float(np.linalg.norm(np.array(ee_pos0) - np.array(obj_pos0)))
+        # Use fingertip midpoint (actual grasp point), not link 33, to match
+        # step()'s dist computation.
+        ee_pos0_arr, _ = self._fingertip_midpoint()
+        ee_pos0        = ee_pos0_arr.tolist()
+        obj_pos0, _    = self.object.get_base_pos_orient()
+        self._prev_dist     = float(np.linalg.norm(ee_pos0_arr - np.asarray(obj_pos0, dtype=np.float32)))
         self._obj_init_z    = float(obj_pos0[2])
         self._prev_obj_above = 0.0
 
@@ -502,9 +569,16 @@ class GraspEnv(gym.Env):
         m.step_simulation(steps=10, realtime=self.env.render)
 
         # ── State ─────────────────────────────────────────────────────────────
-        ee_pos, ee_quat   = self.robot.get_link_pos_orient(self.robot.end_effector)
+        # EE reference is the midpoint between the two fingertips — the actual
+        # grasp point. We still use link 33 (grasp_center) as the constraint
+        # parent because it is rigidly attached to the gripper body; its frame is
+        # fine for multiplyTransforms even though it is not geometrically centred.
+        ee_pos_arr, _     = self._fingertip_midpoint()
+        ee_pos            = ee_pos_arr.tolist()
+        _, ee_quat        = self.robot.get_link_pos_orient(self.robot.end_effector)
         obj_pos, obj_quat = self.object.get_base_pos_orient()
-        dist      = float(np.linalg.norm(np.array(ee_pos) - np.array(obj_pos)))
+        obj_vec           = np.asarray(obj_pos, dtype=np.float32) - ee_pos_arr
+        dist      = float(np.linalg.norm(obj_vec))
         obj_above = float(obj_pos[2] - self._obj_init_z)
         tilt_rad  = float(np.arccos(np.clip(self._object_uprightness(obj_quat), -1.0, 1.0)))
         # Lateral (xy-plane) distance from EE to placement target
@@ -512,14 +586,18 @@ class GraspEnv(gym.Env):
             np.array(ee_pos[:2]) - self._place_target[:2]
         ))
 
-        # ── Auto-grasp trigger: distance-only ────────────────────────────────
+        # ── Auto-grasp trigger: distance + lateral-centring ──────────────────
         # Phase A gripper is open (21 cm span) — it physically cannot contact a
-        # 7 cm bottle from the side.  We trigger purely on EE proximity, then
-        # auto-close and attach a rigid pybullet constraint so the object follows
-        # the EE regardless of friction (standard sim grasping workaround).
+        # 7 cm bottle from the side.  We trigger when (a) the object is close to
+        # the fingertip midpoint AND (b) the lateral offset along the finger-
+        # opening axis is small enough that the object actually sits BETWEEN the
+        # fingers. Without (b), the policy satisfies (a) with the object parked
+        # next to one finger instead of centred — on closing, the fingers miss.
+        _, lateral_axis = self._fingertip_midpoint()
+        lateral_offset  = float(abs(np.dot(obj_vec, lateral_axis)))
         gripper_contact = self._gripper_contact()  # used in obs & reward only
         if not self._gripper_locked:
-            if dist < self.GRASP_DIST:
+            if dist < self.GRASP_DIST and lateral_offset < self.GRASP_LATERAL:
                 self._grasp_confirm += 1
                 if self._grasp_confirm >= self.GRASP_CONFIRM:
                     self._gripper_locked = True
@@ -662,6 +740,7 @@ class GraspEnv(gym.Env):
 
         self._step_info = {
             'dist':           dist,
+            'lateral_offset': lateral_offset,
             'place_dist':     place_dist,
             'obj_lift_m':     obj_above,
             'gripper_contact':float(gripper_contact),

@@ -306,10 +306,22 @@ class VideoLogCallback(EpochTestCallback):
 
     Uses pybullet's ER_TINY_RENDERER (CPU, no display/GPU required).
     Skips silently if wandb is not active or recording fails.
+
+    Args:
+        every_n: Upload cadence in epochs.
+        env_id:  The gym env id to instantiate for recording. MUST match the
+                 env used for training, otherwise the policy is rolled out in a
+                 different task distribution than it was trained on. Previously
+                 hard-coded to 'GraspEnv', which produced misleading videos for
+                 Stage 1 / Stage 2 ablations — e.g. a Stage-2 policy that only
+                 ever saw pre-grasped starts would be recorded in the full task
+                 where the bottle starts on the table, giving the impression
+                 that Stage-2 initialisation was broken.
     """
 
-    def __init__(self, every_n: int = 10) -> None:
+    def __init__(self, every_n: int = 10, env_id: str = 'GraspEnv') -> None:
         self._every_n = every_n
+        self._env_id  = env_id
 
     def callback(self, epoch: int, env_step: int | None, context: TrainingContext) -> None:
         if epoch % self._every_n != 0:
@@ -318,7 +330,7 @@ class VideoLogCallback(EpochTestCallback):
             import wandb
             from tianshou.data import Batch
 
-            env = gym.make('GraspEnv', render_mode='rgb_array')
+            env = gym.make(self._env_id, render_mode='rgb_array')
             obs, _ = env.reset()
             frames: list[np.ndarray] = []
 
@@ -499,7 +511,7 @@ def main():
     record_video = not args.no_video
     if record_video:
         builder = builder.with_epoch_test_callback(
-            VideoLogCallback(every_n=args.video_every)
+            VideoLogCallback(every_n=args.video_every, env_id=cfg['task'])
         )
 
     experiment = builder.build()
