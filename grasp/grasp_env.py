@@ -9,160 +9,101 @@ import mengine as m
 
 
 class GraspEnv(gym.Env):
-    """Phase 1 of hierarchical pick-and-place: reach the object, grasp it, and lift 20 cm.
+    """Demo grasp environment: approach one bottle on a table, auto-grasp, auto-lift.
 
-    Gripper one-shot-close rule
-    ---------------------------
-    The gripper starts fully open every episode.  The lock is committed only
-    after GRASP_CONFIRM_STEPS (2) consecutive simulation steps in which:
-      • BOTH the right finger/fingertip (links 26/27) AND the left finger/
-        fingertip (links 29/30) are in contact with the object  (bilateral
-        contact — ensures the gripper spans the object, not just grazes it),
-      • gripper_angle < GRASP_CLOSE_THRESH, and
-      • dist(EE, obj) < GRASP_DIST.
-    If any condition breaks the counter resets.  Once locked, action[5] is
-    ignored and the gripper stays closed for the rest of the episode.
+    The gripper is fully automatic — the policy only moves the robot to a good
+    position.  Once the end-effector stays within GRASP_DIST of the object for
+    GRASP_CONFIRM steps the gripper closes automatically (Phase A → Phase B).
+    After locking the lift joint is driven upward at a fixed rate; the policy
+    may still adjust base and wrist for balance.
 
-    After locking, a lift-verification window of LIFT_VERIFY_WINDOW (15) steps
-    checks whether the object has actually risen by at least LIFT_VERIFY_MIN
-    (5 mm) above its position at lock time.  If it has not, the episode
-    terminates immediately with a -20 penalty (false-grasp detection).  This
-    catches cases where the gripper clips the bottle body without enclosing it.
+    Observation (21 dims):
+        ee_local        (3)  – EE position in robot base frame
+        diff            (3)  – obj_local - ee_local  (approach vector)
+        place_diff      (3)  – place_target_local - ee_local  (transport vector)
+        joint_obs       (3)  – lift joint, arm_sum, wrist_yaw
+        obj_above       (1)  – object height above its initial z (lift progress)
+        gripper_locked  (1)  – 0 = Phase A, 1 = Phase B/C
+        confirm_frac    (1)  – grasp progress (Phase A); 1.0 when descending (Phase C2)
+        gripper_contact (1)  – 1 if any gripper finger touches object
+        prev_action     (5)  – previous action (smoothness context)
+        ── total: 3+3+3+3+1+1+1+1+5 = 21 ──
 
-    Wrist orientation is FIXED to horizontal (wrist pitch and roll are always
-    zeroed out).  Only wrist yaw is controllable to allow the arm to face
-    the correct direction.  This removes 2 action dims and simplifies learning.
+    Action (5 dims, all in [-1, 1]):
+        [0:2]  base wheel velocities
+        [2]    lift joint delta  (auto-lift in Phase B; free in Phase A/C)
+        [3]    arm extension delta
+        [4]    wrist yaw delta
 
-    Episodes terminate early (terminated=True) the step r_success fires.
-    The Gymnasium time-limit wrapper also ends them at max_episode_steps (300).
+    Phase flow:
+        A (approach)  – !gripper_locked
+        B (lift)      – gripper_locked AND obj_above < LIFT_TARGET_M
+        C (transport) – gripper_locked AND obj_above >= LIFT_TARGET_M
 
-    Observation (33 dims):
-        ee_pos_local       (3)  – end-effector in robot base frame
-        obj_pos_local      (3)  – object in robot base frame
-        diff               (3)  – obj - ee (local)
-        pregrasp_err       (3)  – xy / z / yaw error to pregrasp pose
-        obj_in_ee          (3)  – object position in EE frame (centering & squeeze signal)
-        joint_obs          (3)  – lift, arm_sum, wrist_yaw
-        gripper_angle      (1)  – mean gripper joint (0 = closed, 0.6 = open)
-        right_contact      (1)  – right finger in contact with object
-        left_contact       (1)  – left finger in contact with object
-        bilateral_contact  (1)  – both sides in contact simultaneously
-        uprightness        (1)  – cos(tilt), 1.0 means upright
-        obj_xy_disp        (1)  – table-plane displacement from reset pose
-        obj_above_table    (1)  – object z above initial z
-        gripper_locked     (1)  – 1.0 once the one-shot close is committed
-        grasp_confirm_frac (1)  – lock progress 0→1 (policy sees how close to commit)
-        prev_action        (6)  – previous policy action (for smoothness context)
+    Triggers:
+        A→B: dist(EE, obj) < GRASP_DIST for GRASP_CONFIRM steps
+             → gripper closes + rigid pybullet constraint attaches object to EE
+        B→C: obj_above >= LIFT_TARGET_M (automatic, no action required)
+        C1→C2: lateral dist(EE_xy, place_target_xy) < PLACE_DIST
+               → enters controlled-descent sub-phase
+        C2→done: obj_above < PLACE_HEIGHT_M while descending
+               → constraint released + gripper opens → object rests on table → success
 
-    Action (6 dims, all in [-1, 1]):
-        [0:2]  base wheel velocities (delta)
-        [2]    lift (delta)
-        [3]    arm extension, shared across 4 prismatic joints (delta)
-        [4]    wrist yaw (delta)  — pitch and roll are locked to horizontal
-        [5]    gripper open/close target (+1=open, -1=closed) — ignored after lock
-
-    Reward design — geometry-aware and stability-aware:
-
-    PHASE A  gripper NOT locked yet:
-        r_reach   = clip((prev_pregrasp_metric - pregrasp_metric) * 20, -2, 2)
-                    Potential-based shaping to a pregrasp pose, not object center.
-        r_contact = +2.0  one-time event bonus the first time gripper fingers
-                    touch the object.
-        r_close   = clip((GRIPPER_OPEN - gripper_angle) / GRIPPER_OPEN, 0, 1) * 2.0
-                    Active only under bilateral contact.
-
-    PHASE B  gripper locked (B1: settle → B2: hold → B3: lift):
-        r_grasp        = R_GRASP_BONUS / SETTLE_STEPS per step for first SETTLE_STEPS;
-                         same total credit as a one-time bonus but delivered as a
-                         smooth ramp — eliminates the single-step gradient spike
-        r_hold_quality = continuous score in [-1, +1] via geometric mean of four
-                         normalised quality components (uprightness, lateral centering
-                         in EE frame, gripper enclosure angle, pregrasp centering);
-                         smooth everywhere — no gradient cliffs at threshold edges
-        r_lift         = 0 for SETTLE_STEPS, then 0.3× until hold_ok for
-                         HOLD_STABLE_STEPS, then full clip(Δobj_z*25, -2, 2)
-        r_height_hold  = HEIGHT_HOLD_BONUS * (obj_above / LIFT_TARGET_M) per step
-                         when hold is stable and object is above HEIGHT_HOLD_THRESH;
-                         rewards *being* at height, complementing the delta-based lift
-        r_pose_stable  = pose-change penalty, active only for POSE_STABLE_WINDOW steps
-                         then fades to 0 so normal lifting is never penalised
-        r_fail         = -min((locked_steps - LOCK_GRACE_STEPS) * LOCK_PENALTY_RATE, 2.0)
-        r_verify_fail  = -20.0  fired once at LIFT_VERIFY_WINDOW if rise < LIFT_VERIFY_MIN
-        r_success      = +100.0  one-time bonus when obj_lift >= LIFT_TARGET
-
-    Always:
-        r_step          = -0.05  (time pressure)
-        r_tilt_pen      – penalise object tilt beyond TILT_FREE_RAD
-        r_push_pen      – penalise xy displacement; decays to 0 as object is lifted
-                          past LIFT_CLEAR_H (so natural lift motion isn't penalised)
-        r_action_mag    – penalise large action magnitude
-        r_action_delta  – penalise action jump (high-frequency jitter)
-        r_action_delta_z – extra z-dimension delta penalty to suppress up/down hunting
-
-    Action scaling:
-        Base speed is multiplied by a proximity factor that decreases linearly from
-        1.0 at SLOWDOWN_FAR to SLOWDOWN_MIN at SLOWDOWN_NEAR, preventing the policy
-        from crashing into the object at full approach speed.
+    Reward:
+        Phase A:  r_reach    = clip((prev_dist  - dist)       * 10, -2, 2)
+        Phase B:  r_lift     = clip(delta_z                   * 20, -2, 2)
+                  r_height   = 0.3 * clip(obj_above/LIFT_TARGET, 0, 1)  [above 2 cm]
+                  r_lift_done = +10 (one-time, on entering Phase C)
+                  r_false    = -10 if rise < LIFT_VERIFY_MIN at LIFT_VERIFY_WIN
+        Phase C1: r_transport = clip((prev_place_dist - place_dist) * 10, -2, 2)
+        Phase C2: r_descend  = clip((prev_obj_above - obj_above)    * 10, -2, 2)
+                  r_place_done = +100 (terminal, on successful placement)
+        Always:   r_step = -0.02,  r_action = -0.005 * ||action||^2
     """
 
     metadata = {'render_modes': ['human', 'rgb_array']}
 
     # ── Constants ─────────────────────────────────────────────────────────────
-    GRIPPER_OPEN        = 0.6    # pybullet joint angle: open
-    GRIPPER_CLOSE       = 0.0    # pybullet joint angle: closed
-    GRASP_DIST          = 0.12   # metres: EE must be within this to trigger lock
-    GRASP_CLOSE_THRESH  = 0.35   # gripper angle below this = "closed enough" to lock
-    GRASP_CONFIRM_STEPS = 4      # consecutive stable-contact steps required to commit lock
-    CLOSE_CONFIRM_STEPS = 3      # consecutive "commanded close" steps before lock can commit
-    LOCK_LATERAL_THRESH = 0.05   # metres: object must be centered between fingers
-    LOCK_XY_PUSH_THRESH = 0.08   # metres: reject lock if object was pushed too far on table
-    UPRIGHT_LOCK_MIN    = 0.88   # cos(tilt) lower bound for lock/hold gating
-    GRIP_ENCLOSE_MIN    = 0.08   # gripper angle lower bound: object must be inside, not crushed flat
-    OBJ_EE_LAT_THRESH   = 0.07   # metres: obj_in_ee y-component must be small (centered in jaw)
-    LIFT_TARGET_M       = 0.20   # metres above initial object z = success (20 cm)
-    LIFT_CLEAR_H        = 0.03   # metres above table at which push-penalty starts to decay
-    LOCK_GRACE_STEPS    = 30     # steps after lock before failure penalty starts
-    LOCK_PENALTY_RATE   = 0.01   # penalty magnitude added per step beyond the grace window
-    LIFT_VERIFY_WINDOW  = 20     # steps after lock within which the object must begin rising
-    LIFT_VERIFY_MIN     = 0.005  # metres the object must have risen above lock position to pass
-    SETTLE_STEPS        = 6      # post-lock quiet window: only hold-quality signal, no lift pressure
-    HOLD_STABLE_STEPS   = 4      # consecutive hold-ok steps before full r_lift weight resumes
-    POSE_STABLE_WINDOW  = 12     # steps post-lock during which r_pose_stable is active
+    GRIPPER_OPEN     = 0.6
+    GRIPPER_CLOSE    = 0.0
 
-    PREGRASP_XY_OFFSET  = 0.08   # metres behind object along robot->object direction
-    PREGRASP_Z_OFFSET   = 0.00   # metres relative to object COM for pregrasp target
-    PREGRASP_YAW_WEIGHT = 0.5    # relative weight for yaw alignment in pregrasp shaping
+    # Phase A (approach → grasp)
+    GRASP_DIST       = 0.12    # metres: EE within this distance triggers grasp
+    GRASP_CONFIRM    = 4       # consecutive close-enough steps to commit
 
-    TILT_FREE_RAD         = np.deg2rad(10.0)
-    TILT_PENALTY_SCALE    = 0.6
-    XY_PUSH_PENALTY_SCALE = 1.2
-    ACTION_MAG_PENALTY    = 0.01
-    ACTION_DELTA_PENALTY  = 0.08
-    ACTION_DELTA_Z_PENALTY = 0.12   # extra penalty for z-dimension jitter (hunting up/down)
+    # Phase B (lift)
+    AUTO_LIFT        = 0.8     # lift action override in Phase B
+    LIFT_TARGET_M    = 0.15    # metres above initial z → triggers Phase C
+    LIFT_VERIFY_WIN  = 20      # steps after lock to start rising
+    LIFT_VERIFY_MIN  = 0.005   # minimum rise (m) to pass lift verification
+    LIFT_DONE_BONUS  = 10.0    # one-time reward when Phase C begins
 
-    # Speed limiting is based on pregrasp metric (same quantity used in r_reach)
-    # so the slowdown signal is always consistent with what the reward optimises.
-    # When locked the slowdown is bypassed — the robot may need to manoeuvre freely.
-    SLOWDOWN_REACH_NEAR = 0.20   # pregrasp metric below which base speed → SLOWDOWN_MIN
-    SLOWDOWN_REACH_FAR  = 0.60   # pregrasp metric above which base speed is unrestricted
-    SLOWDOWN_MIN        = 0.15   # minimum speed factor
+    # Phase C1 (lateral transport) → Phase C2 (controlled descent) → release
+    PLACE_DIST       = 0.20    # lateral threshold to trigger descent (C1 → C2)
+    AUTO_DESCEND     = -0.8    # lift action override during descent (mirrors AUTO_LIFT)
+    PLACE_HEIGHT_M   = 0.03    # obj_above below this → release constraint (gentle place)
+    PLACE_SUCCESS    = 100.0   # terminal reward on placement
+    PLACE_MIN_DIST   = 0.20    # min lateral distance of place_target from pickup
+    PLACE_MAX_DIST   = 0.40    # max lateral distance of place_target from pickup
 
-    HEIGHT_HOLD_BONUS  = 0.30   # per-step bonus for stably holding at height (non-potential)
-    HEIGHT_HOLD_THRESH = 0.05   # object must be at least this far above table to earn bonus
+    # Friction coefficients applied at reset (pybullet changeDynamics).
+    # Default PyBullet friction (~0.5) is far too low to hold a 0.5 kg bottle.
+    OBJ_LATERAL_FRICTION  = 3.0
+    OBJ_SPINNING_FRICTION = 0.5
+    OBJ_ROLLING_FRICTION  = 0.1
+    GRIP_LATERAL_FRICTION = 3.0
 
-    ACTION_MAX_DELTA    = np.array([0.25, 0.25, 0.18, 0.18, 0.22, 0.6], dtype=np.float32)
-    R_GRASP_BONUS       = 5.0    # one-time lock bonus (was 10, reduced to limit "chase lock" exploit)
+    # Gripper finger / fingertip link indices on the Stretch3 body.
+    _GRIPPER_LINKS = frozenset([26, 27, 29, 30])
 
-    # PyBullet link indices for the gripper fingers and fingertips only.
-    # Contacts from any other robot link (arm, base, …) are ignored for lock/reward.
-    #   26 = link_gripper_finger_right   27 = link_gripper_fingertip_right
-    #   29 = link_gripper_finger_left    30 = link_gripper_fingertip_left
-    _GRIPPER_LINK_INDICES = frozenset([26, 27, 29, 30])
-    # Separate left / right sets used for bilateral-contact lock requirement.
-    # For elongated objects (mustard bottle) both sides must be in contact to
-    # confirm the gripper spans the object rather than swiping one side.
-    _GRIPPER_RIGHT_LINKS  = frozenset([26, 27])
-    _GRIPPER_LEFT_LINKS   = frozenset([29, 30])
+    TILT_FREE_RAD       = np.deg2rad(15.0)
+    TILT_PENALTY_SCALE  = 0.3
+
+    ACTION_MAX_DELTA = np.array([0.25, 0.25, 0.18, 0.18, 0.22], dtype=np.float32)
+
+    SLOWDOWN_DIST_NEAR = 0.20   # below this distance base speed is reduced
+    SLOWDOWN_DIST_FAR  = 0.60   # above this distance base speed is unrestricted
+    SLOWDOWN_MIN       = 0.15
 
     # controllable_joints = [0, 1, 4, 6, 7, 8, 9, 10, 12, 13, 26, 29]
     # indices:               0  1  2  3  4  5  6   7   8   9  10  11
@@ -177,116 +118,187 @@ class GraspEnv(gym.Env):
     _CAM_TARGET = [-0.6, 0.0, 0.85]
     _CAM_W, _CAM_H = 480, 320
 
-    def __init__(self, render_mode=None, **kwargs):
-        self.render_mode   = render_mode
-        self.env           = m.Env(gravity=[0, 0, -9.81], render=render_mode == 'human')
+    def __init__(self, render_mode=None, curriculum_stage: int | str = 'full', **kwargs):
+        """
+        Args:
+            curriculum_stage: Controls which sub-task is trained.
+                1  – Phase A+B only (approach + grasp + lift).
+                     Episode terminates as success when object reaches LIFT_TARGET_M.
+                     Use for Stage-1 curriculum pre-training.
+                2  – Phase C only (transport + descend + place).
+                     Episode starts with robot already holding the lifted object.
+                     Use for Stage-2 curriculum pre-training.
+                'full' (default) – Full A→B→C pick-and-place task.
+        """
+        self.render_mode       = render_mode
+        self._curriculum_stage = int(curriculum_stage) if curriculum_stage != 'full' else 'full'
+        self.env               = m.Env(gravity=[0, 0, -9.81], render=render_mode == 'human')
+        # 21 dims: ee_local(3)+diff(3)+place_diff(3)+joint_obs(3)+scalars(4)+prev_action(5)
         self.observation_space = gym.spaces.Box(
-            low=-10.0, high=10.0, shape=(33,), dtype=np.float32
+            low=-10.0, high=10.0, shape=(21,), dtype=np.float32
         )
         self.action_space = gym.spaces.Box(
-            low=-1.0, high=1.0, shape=(6,), dtype=np.float32
+            low=-1.0, high=1.0, shape=(5,), dtype=np.float32
         )
-        self.table_height: float     = 0.85
-        self.object                  = None
-        self.robot                   = None
-        self._gripper_locked: bool   = False
-        self._grasp_confirm: int     = 0      # consecutive valid-contact steps toward lock
-        self._prev_dist: float       = 1.0
-        self._obj_init_z: float      = 0.0    # object z at episode start (lift reference)
-        self._obj_init_xy            = np.zeros(2, dtype=np.float32)
-        self._prev_obj_above: float  = 0.0    # obj_above at the previous step (for r_lift diff)
-        self._prev_reach_metric: float = 0.0  # previous pregrasp geometry metric
+        self.table_height: float   = 0.85
+        self.object                = None
+        self.robot                 = None
+        self._gripper_locked: bool = False
+        self._grasp_confirm: int   = 0
+        self._locked_steps: int    = 0
+        self._lock_obj_above: float = 0.0
+        self._obj_init_z: float    = 0.0
+        self._prev_dist: float     = 1.0
+        self._prev_obj_above: float = 0.0
         self._success_rewarded: bool = False
-        self._contact_rewarded: bool = False  # True after the one-time r_contact bonus fires
-        self._locked_steps: int      = 0      # steps elapsed since gripper locked
-        self._lock_obj_above: float  = 0.0    # obj_above at the moment of locking (for lift verify)
-        self._close_confirm: int     = 0      # consecutive "close command" steps
-        self._hold_stable_steps: int = 0      # consecutive post-lock stable-hold steps
-        self._prev_action            = np.zeros(self.action_space.shape[0], dtype=np.float32)
-        self._prev_rel_obj           = np.zeros(3, dtype=np.float32)
-        self._step_info: dict        = {}
+        self._contact_rewarded: bool = False
+        self._grasp_constraint: int  = -1   # pybullet constraint id (-1 = none)
+        self._phase_c:         bool = False   # True once lift target reached
+        self._place_descend:   bool = False   # True during controlled descent (C2)
+        self._lift_done_rewarded: bool = False
+        self._place_target: np.ndarray = np.zeros(3, dtype=np.float32)
+        self._prev_place_dist: float   = 1.0
+        self._prev_action          = np.zeros(5, dtype=np.float32)
+        self._step_info: dict      = {}
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _angle_wrap(x: float) -> float:
-        return float(np.arctan2(np.sin(x), np.cos(x)))
-
-    @staticmethod
     def _object_uprightness(obj_quat) -> float:
         mat = np.array(p.getMatrixFromQuaternion(obj_quat), dtype=np.float32).reshape(3, 3)
-        # cosine between object local +z and world +z
         return float(np.clip(mat[2, 2], -1.0, 1.0))
 
-    def _pregrasp_errors(self, ee_pos, obj_pos, wrist_yaw: float):
-        obj_xy = np.array(obj_pos[:2], dtype=np.float32)
-        robot_xy = np.array(self.robot.get_base_pos_orient()[0][:2], dtype=np.float32)
-        approach = obj_xy - robot_xy
-        norm = float(np.linalg.norm(approach))
-        if norm < 1e-6:
-            approach = np.array([1.0, 0.0], dtype=np.float32)
-        else:
-            approach = approach / norm
-
-        pre_xy = obj_xy - approach * self.PREGRASP_XY_OFFSET
-        pre_z = float(obj_pos[2] + self.PREGRASP_Z_OFFSET)
-        ee_xy = np.array(ee_pos[:2], dtype=np.float32)
-        xy_err_vec = ee_xy - pre_xy
-        xy_err = float(np.linalg.norm(xy_err_vec))
-        z_err = float(ee_pos[2] - pre_z)
-        desired_yaw = float(np.arctan2(approach[1], approach[0]))
-        yaw_err = self._angle_wrap(wrist_yaw - desired_yaw)
-        return xy_err, z_err, yaw_err
+    def _gripper_contact(self) -> bool:
+        """True if any gripper finger/fingertip is in contact with the object."""
+        contacts = self.robot.get_contact_points(bodyB=self.object)
+        return bool(contacts and any(c['linkA'] in self._GRIPPER_LINKS for c in contacts))
 
     def _get_obs(self) -> np.ndarray:
-        ee_pos, ee_quat = self.robot.get_link_pos_orient(self.robot.end_effector)
-        obj_pos, obj_quat = self.object.get_base_pos_orient()
+        ee_pos, _ = self.robot.get_link_pos_orient(self.robot.end_effector)
+        obj_pos, _ = self.object.get_base_pos_orient()
 
         ee_local,  _ = self.robot.global_to_local_coordinate_frame(ee_pos)
         obj_local, _ = self.robot.global_to_local_coordinate_frame(obj_pos)
         diff = obj_local - ee_local
 
+        # Place target direction (always present; policy ignores in Phase A/B)
+        pt_local, _ = self.robot.global_to_local_coordinate_frame(
+            self._place_target.tolist()
+        )
+        place_diff = pt_local - ee_local
+
         ja      = self.robot.get_joint_angles(self.robot.controllable_joints)
         lift    = ja[self._IDX_LIFT]
         arm_sum = ja[self._IDX_ARM_START:self._IDX_ARM_END].sum()
         wrist   = ja[self._IDX_WRIST]
-        gripper = float((ja[self._IDX_GRIP_L] + ja[self._IDX_GRIP_R]) / 2.0)
-        pre_xy_err, pre_z_err, pre_yaw_err = self._pregrasp_errors(
-            ee_pos=ee_pos, obj_pos=obj_pos, wrist_yaw=float(wrist[0])
-        )
 
-        inv_pos, inv_quat = p.invertTransform(ee_pos, ee_quat)
-        obj_in_ee, _ = p.multiplyTransforms(inv_pos, inv_quat, obj_pos, [0, 0, 0, 1])
-        obj_in_ee = np.array(obj_in_ee, dtype=np.float32)
+        obj_above = float(obj_pos[2] - self._obj_init_z)
 
-        all_contacts = self.robot.get_contact_points(bodyB=self.object)
-        right_contact = bool(all_contacts and any(c['linkA'] in self._GRIPPER_RIGHT_LINKS for c in all_contacts))
-        left_contact = bool(all_contacts and any(c['linkA'] in self._GRIPPER_LEFT_LINKS for c in all_contacts))
-        bilateral_contact = right_contact and left_contact
-        obj_above    = float(obj_pos[2] - self._obj_init_z)
-        obj_xy_disp = float(np.linalg.norm(np.array(obj_pos[:2], dtype=np.float32) - self._obj_init_xy))
-        uprightness = self._object_uprightness(obj_quat)
+        # confirm_frac: grasp progress in Phase A/B, 1.0 when descending (Phase C2)
+        if self._place_descend:
+            confirm_frac = 1.0
+        else:
+            confirm_frac = float(self._grasp_confirm) / float(self.GRASP_CONFIRM)
 
-        grasp_confirm_frac = float(self._grasp_confirm) / float(self.GRASP_CONFIRM_STEPS)
+        contact = self._gripper_contact()
 
         return np.concatenate([
-            ee_local,                                       # 3
-            obj_local,                                      # 3
-            diff,                                           # 3
-            [pre_xy_err, pre_z_err, pre_yaw_err],           # 3
-            obj_in_ee,                                      # 3
-            [lift, arm_sum, wrist[0]],                      # 3  yaw only
-            [gripper],                                      # 1
-            [1.0 if right_contact else 0.0],                # 1
-            [1.0 if left_contact else 0.0],                 # 1
-            [1.0 if bilateral_contact else 0.0],            # 1
-            [uprightness],                                  # 1
-            [obj_xy_disp],                                  # 1
-            [obj_above],                                    # 1
-            [1.0 if self._gripper_locked else 0.0],         # 1
-            [grasp_confirm_frac],                           # 1  progress toward lock
-            self._prev_action,                              # 6
+            ee_local,                                 # 3
+            diff,                                     # 3
+            place_diff,                               # 3  ← NEW
+            [lift, arm_sum, wrist[0]],                # 3
+            [obj_above],                              # 1
+            [1.0 if self._gripper_locked else 0.0],   # 1
+            [confirm_frac],                           # 1
+            [1.0 if contact else 0.0],                # 1
+            self._prev_action,                        # 5
         ]).astype(np.float32)
+
+    def _init_stage2(self) -> None:
+        """Teleport robot to optimal pickup pose, create a grasp constraint, and
+        lift the object to LIFT_TARGET_M.  Called at the end of reset() when
+        curriculum_stage == 2 so each episode starts directly in Phase C.
+        """
+        client = self.env.id
+        robot  = self.robot
+        cj     = robot.controllable_joints
+
+        obj_pos0, obj_quat0 = self.object.get_base_pos_orient()
+
+        # 1. Teleport robot so arm points toward the object in the -x world direction.
+        #    Stretch3 arm extends in -y of the robot frame; rotating base by -π/2 makes
+        #    the arm extension point in the -x world direction toward the object.
+        ARM_EXT  = 0.20   # arm extension target (m)
+        ARM_ZERO = 0.415  # approx EE-x offset from base when arm=0
+        base_x   = float(obj_pos0[0]) + ARM_ZERO + ARM_EXT
+        base_y   = float(obj_pos0[1])
+        bq = p.getQuaternionFromEuler([0, 0, -np.pi / 2], physicsClientId=client)
+        p.resetBasePositionAndOrientation(
+            robot.body, [base_x, base_y, 0], bq, physicsClientId=client
+        )
+
+        # 2. Set arm joints to ARM_EXT (four prismatic joints share the extension).
+        for ki in range(self._IDX_ARM_START, self._IDX_ARM_END):
+            p.resetJointState(robot.body, cj[ki], ARM_EXT / 4, physicsClientId=client)
+        m.step_simulation(steps=5, realtime=False)
+
+        # 3. Compute the invariant offset: lz = EE_z - lift_joint_value.
+        ee_t, _ = robot.get_link_pos_orient(robot.end_effector)
+        ja_t    = robot.get_joint_angles(cj)
+        lz      = ee_t[2] - ja_t[self._IDX_LIFT]
+
+        # 4. Set lift joint so EE aligns with the object's initial z (grasp height),
+        #    then create the constraint immediately (before any simulation steps that
+        #    would let gravity pull the object down).
+        tl_grasp = float(np.clip(float(obj_pos0[2]) - lz, 0.05, 1.05))
+        p.resetJointState(robot.body, cj[self._IDX_LIFT], tl_grasp, physicsClientId=client)
+
+        # 5. Create constraint at the current EE / object poses (no simulation yet).
+        ee_pos, ee_quat   = robot.get_link_pos_orient(robot.end_effector)
+        obj_pos_g, oq_g   = self.object.get_base_pos_orient()
+        inv_ep, inv_eq    = p.invertTransform(ee_pos, ee_quat)
+        rel_pos, rel_quat = p.multiplyTransforms(
+            inv_ep, inv_eq, obj_pos_g, oq_g, physicsClientId=client,
+        )
+        self._grasp_constraint = p.createConstraint(
+            robot.body, robot.end_effector,
+            self.object.body, -1,
+            p.JOINT_FIXED, [0, 0, 0],
+            list(rel_pos), [0, 0, 0], list(rel_quat),
+            physicsClientId=client,
+        )
+        p.changeConstraint(self._grasp_constraint, maxForce=50, physicsClientId=client)
+
+        # 6. NOW teleport lift joint AND object to the lifted height, then stabilise.
+        #    Both are moved together so the constraint can immediately lock the
+        #    relative pose without fighting gravity over many simulation steps.
+        lifted_z = float(obj_pos0[2]) + self.LIFT_TARGET_M
+        tl_lift  = float(np.clip(lifted_z - lz, 0.05, 1.05))
+        p.resetJointState(robot.body, cj[self._IDX_LIFT], tl_lift, physicsClientId=client)
+        p.resetBasePositionAndOrientation(
+            self.object.body,
+            [float(obj_pos0[0]), float(obj_pos0[1]), lifted_z],
+            list(obj_quat0),
+            physicsClientId=client,
+        )
+        m.step_simulation(steps=20, realtime=False)
+
+        # 6. Set all Phase C state variables so step() starts from Phase C.
+        ee_final, _  = robot.get_link_pos_orient(robot.end_effector)
+        obj_final, _ = self.object.get_base_pos_orient()
+        obj_above    = float(obj_final[2] - self._obj_init_z)
+
+        self._gripper_locked     = True
+        self._grasp_confirm      = self.GRASP_CONFIRM         # already triggered
+        self._locked_steps       = self.LIFT_VERIFY_WIN + 1   # past verification window
+        self._lock_obj_above     = obj_above
+        self._phase_c            = True
+        self._lift_done_rewarded = True
+        self._prev_obj_above     = obj_above
+        self._prev_dist          = 0.0  # Phase A potential not used in Phase C
+        self._prev_place_dist    = float(np.linalg.norm(
+            np.array(ee_final[:2]) - self._place_target[:2]
+        ))
 
     def _get_info(self) -> dict:
         return dict(self._step_info)
@@ -318,25 +330,33 @@ class GraspEnv(gym.Env):
         super().reset(seed=seed)
         self.seed(seed)
         self.env.reset()
-        self._gripper_locked   = False
-        self._grasp_confirm    = 0
-        self._success_rewarded = False
-        self._contact_rewarded = False
-        self._locked_steps     = 0
-        self._lock_obj_above   = 0.0
-        self._close_confirm    = 0
-        self._hold_stable_steps = 0
-        self._prev_dist        = 1.0    # overwritten after scene settles
-        self._obj_init_z       = 0.0    # overwritten after scene settles
-        self._obj_init_xy      = np.zeros(2, dtype=np.float32)
-        self._prev_obj_above   = 0.0    # overwritten after scene settles
-        self._prev_reach_metric = 0.0
-        self._prev_action      = np.zeros(self.action_space.shape[0], dtype=np.float32)
-        self._prev_rel_obj     = np.zeros(3, dtype=np.float32)
-        self._step_info        = {}
+        self._gripper_locked  = False
+        self._grasp_confirm   = 0
+        self._locked_steps    = 0
+        self._lock_obj_above  = 0.0
+        self._success_rewarded     = False
+        self._contact_rewarded     = False
+        self._grasp_constraint     = -1
+        self._phase_c              = False
+        self._place_descend        = False
+        self._lift_done_rewarded   = False
+        self._place_target         = np.zeros(3, dtype=np.float32)
+        self._prev_place_dist      = 1.0
+        self._prev_dist            = 1.0
+        self._obj_init_z      = 0.0
+        self._prev_obj_above  = 0.0
+        self._prev_action     = np.zeros(5, dtype=np.float32)
+        self._step_info       = {}
 
         _ = m.Ground()
-        height_offset     = np.random.uniform(-0.2, 0.2)
+        # Limit table height variation so the lift joint always has enough range
+        # to lift 0.15 m above the bottle.
+        # Lift max = 1.1 m.  EE_z ≈ lift + 0.111.
+        # For bottle at table_height: lift_to_grasp ≈ table_height - 0.111,
+        # remaining = 1.1 - lift_to_grasp = 1.211 - table_height ≥ 0.15 m
+        # → table_height ≤ 1.061 m, i.e. height_offset ≤ 0.211 - 0.85 ≈ 0.21 m.
+        # Use ±0.10 m to have comfortable margin.
+        height_offset     = np.random.uniform(-0.10, 0.10)
         self.table_height = 0.85 + height_offset
 
         _ = m.URDF(
@@ -361,57 +381,90 @@ class GraspEnv(gym.Env):
         pos_y = np.random.uniform(-0.1, 0.1)
         theta = np.random.uniform(-np.pi / 4, np.pi / 4)
         self.robot = m.Robot.Stretch3(position=[pos_x, pos_y, 0], orientation=[0, 0, theta])
-        self.robot.set_joint_angles(angles=[0.9], joints=[4])
-
-        # Always start open
+        # Set initial lift so EE starts ~10 cm below table top, giving the
+        # policy room to descend to the bottle AND lift it by LIFT_TARGET_M.
+        # EE_z ≈ lift + 0.111.  We want EE_z = table_height - 0.10.
+        init_lift = float(np.clip(self.table_height - 0.10 - 0.111, 0.05, 1.05))
+        self.robot.set_joint_angles(angles=[init_lift], joints=[4])
         self.robot.set_gripper_position(
             [self.GRIPPER_OPEN, self.GRIPPER_OPEN], set_instantly=True
         )
 
+        # Boost friction so the gripper can hold the 0.5 kg bottle.
+        # PyBullet default (~0.5) produces only ~0.1 N friction — far below
+        # the 4.9 N needed to support the bottle weight.
+        p.changeDynamics(
+            self.object.body, -1,
+            lateralFriction=self.OBJ_LATERAL_FRICTION,
+            spinningFriction=self.OBJ_SPINNING_FRICTION,
+            rollingFriction=self.OBJ_ROLLING_FRICTION,
+            physicsClientId=self.env.id,
+        )
+        for link_idx in self._GRIPPER_LINKS:
+            p.changeDynamics(
+                self.robot.body, link_idx,
+                lateralFriction=self.GRIP_LATERAL_FRICTION,
+                physicsClientId=self.env.id,
+            )
+
         m.step_simulation(steps=20, realtime=False)
 
-        # Snapshot initial positions so step-1 gets no spurious distance bonus.
         ee_pos0, _  = self.robot.get_link_pos_orient(self.robot.end_effector)
         obj_pos0, _ = self.object.get_base_pos_orient()
-        self._prev_dist      = float(np.linalg.norm(np.array(ee_pos0) - np.array(obj_pos0)))
-        self._obj_init_z     = float(obj_pos0[2])    # lift is measured relative to this
-        self._obj_init_xy    = np.array(obj_pos0[:2], dtype=np.float32)
-        self._prev_obj_above = 0.0                   # obj_above is 0 by definition at reset
-        self._prev_rel_obj   = np.array(obj_pos0, dtype=np.float32) - np.array(ee_pos0, dtype=np.float32)
-        ja0 = self.robot.get_joint_angles(self.robot.controllable_joints)
-        wrist_yaw0 = float(ja0[self._IDX_WRIST][0])
-        xy0, z0, yaw0 = self._pregrasp_errors(ee_pos=ee_pos0, obj_pos=obj_pos0, wrist_yaw=wrist_yaw0)
-        self._prev_reach_metric = xy0 + 0.5 * abs(z0) + self.PREGRASP_YAW_WEIGHT * abs(yaw0)
+        self._prev_dist     = float(np.linalg.norm(np.array(ee_pos0) - np.array(obj_pos0)))
+        self._obj_init_z    = float(obj_pos0[2])
+        self._prev_obj_above = 0.0
+
+        # Generate placement target: random point on the table within reach,
+        # at least PLACE_MIN_DIST away from the pickup position.
+        angle  = np.random.uniform(-np.pi, np.pi)
+        radius = np.random.uniform(self.PLACE_MIN_DIST, self.PLACE_MAX_DIST)
+        px = float(obj_pos0[0]) + radius * np.cos(angle)
+        py = float(obj_pos0[1]) + radius * np.sin(angle)
+        # Clamp to table surface area so the target is reachable.
+        px = float(np.clip(px, -0.95, -0.50))
+        py = float(np.clip(py, -0.30,  0.30))
+        self._place_target = np.array([px, py, self.table_height], dtype=np.float32)
+        # Initialise transport potential with EE distance to placement target.
+        self._prev_place_dist = float(np.linalg.norm(
+            np.array(ee_pos0[:2]) - self._place_target[:2]
+        ))
+
+        # Stage 2: skip Phase A/B, start directly in Phase C (pre-grasped + lifted).
+        if self._curriculum_stage == 2:
+            self._init_stage2()
 
         return self._get_obs(), self._get_info()
 
     def step(self, action):
-        scale  = 0.025
+        scale = 0.025
         action = np.asarray(action, dtype=np.float32)
         action = np.clip(action, self.action_space.low, self.action_space.high)
-        action_delta = action - self._prev_action
+        action_delta  = action - self._prev_action
         clipped_delta = np.clip(action_delta, -self.ACTION_MAX_DELTA, self.ACTION_MAX_DELTA)
-        action_cmd = np.clip(self._prev_action + clipped_delta, self.action_space.low, self.action_space.high)
+        action_cmd    = np.clip(
+            self._prev_action + clipped_delta,
+            self.action_space.low, self.action_space.high,
+        )
 
-        if self._gripper_locked:
-            grip_target = self.GRIPPER_CLOSE          # ignore action[5], stay closed
-        else:
-            grip_target = float(np.interp(
-                action_cmd[5], [-1.0, 1.0], [self.GRIPPER_CLOSE, self.GRIPPER_OPEN]
-            ))
+        # Gripper: always open in Phase A, always closed in Phase B.
+        grip_target = self.GRIPPER_CLOSE if self._gripper_locked else self.GRIPPER_OPEN
 
-        # Proximity-based base speed limiting, keyed on the SAME pregrasp metric
-        # used in r_reach so that the speed signal and the reward signal are
-        # geometrically consistent.  Uses the previous-step snapshot so no extra
-        # physics query is needed before the simulation advances.
-        # When locked the limit is bypassed: the robot must be free to manoeuvre
-        # (e.g. retract arm) while carrying the object.
+        # Phase B:  auto-lift  (override lift action upward)
+        # Phase C2: auto-descend (override lift action downward for gentle placement)
+        # Phase C1: lift is free (policy maintains height during lateral transport)
+        if self._gripper_locked and not self._phase_c:
+            action_cmd[2] = self.AUTO_LIFT
+        elif self._place_descend:
+            action_cmd[2] = self.AUTO_DESCEND
+
+        # Base speed limiting: slow down when close to object (Phase A only).
         if self._gripper_locked:
             speed_factor = 1.0
         else:
             speed_factor = float(np.clip(
-                (self._prev_reach_metric - self.SLOWDOWN_REACH_NEAR)
-                / (self.SLOWDOWN_REACH_FAR - self.SLOWDOWN_REACH_NEAR),
+                (self._prev_dist - self.SLOWDOWN_DIST_NEAR)
+                / (self.SLOWDOWN_DIST_FAR - self.SLOWDOWN_DIST_NEAR),
                 self.SLOWDOWN_MIN, 1.0,
             ))
 
@@ -419,12 +472,12 @@ class GraspEnv(gym.Env):
             action_cmd[0:2] * 0.5 * speed_factor,
             [action_cmd[2] * scale],
             [action_cmd[3] / 4.0 * scale] * 4,
-            [action_cmd[4] * scale, 0.0, 0.0],   # yaw only; pitch/roll fixed to horizontal
+            [action_cmd[4] * scale, 0.0, 0.0],  # yaw only; pitch/roll locked
             [grip_target, grip_target],
         ])
 
-        current        = self.robot.get_joint_angles(self.robot.controllable_joints)
-        target         = current + scaled
+        current = self.robot.get_joint_angles(self.robot.controllable_joints)
+        target  = current + scaled
         target[self._IDX_GRIP_L] = grip_target
         target[self._IDX_GRIP_R] = grip_target
 
@@ -432,304 +485,184 @@ class GraspEnv(gym.Env):
         m.step_simulation(steps=10, realtime=self.env.render)
 
         # ── State ─────────────────────────────────────────────────────────────
-        ee_pos, ee_quat = self.robot.get_link_pos_orient(self.robot.end_effector)
+        ee_pos, ee_quat   = self.robot.get_link_pos_orient(self.robot.end_effector)
         obj_pos, obj_quat = self.object.get_base_pos_orient()
-        dist               = float(np.linalg.norm(np.array(ee_pos) - np.array(obj_pos)))
-        obj_above          = float(obj_pos[2] - self._obj_init_z)
-        obj_xy_disp        = float(np.linalg.norm(np.array(obj_pos[:2], dtype=np.float32) - self._obj_init_xy))
-        uprightness        = self._object_uprightness(obj_quat)
-        tilt_rad           = float(np.arccos(np.clip(uprightness, -1.0, 1.0)))
+        dist      = float(np.linalg.norm(np.array(ee_pos) - np.array(obj_pos)))
+        obj_above = float(obj_pos[2] - self._obj_init_z)
+        tilt_rad  = float(np.arccos(np.clip(self._object_uprightness(obj_quat), -1.0, 1.0)))
+        # Lateral (xy-plane) distance from EE to placement target
+        place_dist = float(np.linalg.norm(
+            np.array(ee_pos[:2]) - self._place_target[:2]
+        ))
 
-        ja            = self.robot.get_joint_angles(self.robot.controllable_joints)
-        gripper_angle = float((ja[self._IDX_GRIP_L] + ja[self._IDX_GRIP_R]) / 2.0)
-        wrist_yaw = float(ja[self._IDX_WRIST][0])
-        pre_xy_err, pre_z_err, pre_yaw_err = self._pregrasp_errors(
-            ee_pos=ee_pos, obj_pos=obj_pos, wrist_yaw=wrist_yaw
-        )
-        reach_now = (
-            pre_xy_err
-            + 0.5 * abs(pre_z_err)
-            + self.PREGRASP_YAW_WEIGHT * abs(pre_yaw_err)
-        )
-
-        # Object position in EE frame — needed for hold-quality squeeze detection.
-        inv_pos, inv_quat = p.invertTransform(ee_pos, ee_quat)
-        obj_in_ee, _ = p.multiplyTransforms(inv_pos, inv_quat, obj_pos, [0, 0, 0, 1])
-        obj_in_ee = np.array(obj_in_ee, dtype=np.float32)
-
-        # Filter contacts to gripper finger/fingertip links only.
-        # Contacts from the arm, base, or other links are ignored to prevent
-        # the policy from exploiting non-gripper body touches.
-        all_contacts    = self.robot.get_contact_points(bodyB=self.object)
-        # Any gripper contact (either side) — used for r_contact reward and obs.
-        gripper_contact = bool(
-            all_contacts and
-            any(c['linkA'] in self._GRIPPER_LINK_INDICES for c in all_contacts)
-        )
-        # Bilateral contact: both left AND right finger sets must be in contact.
-        # For elongated objects like the mustard bottle this confirms the gripper
-        # spans the object body rather than merely grazing one side of the bottle.
-        right_contact     = bool(all_contacts and any(c['linkA'] in self._GRIPPER_RIGHT_LINKS for c in all_contacts))
-        left_contact      = bool(all_contacts and any(c['linkA'] in self._GRIPPER_LEFT_LINKS  for c in all_contacts))
-        bilateral_contact = right_contact and left_contact
-
-        # ── One-shot lock trigger ─────────────────────────────────────────────
-        # Require GRASP_CONFIRM_STEPS consecutive steps where:
-        #   • both gripper sides touch the object (bilateral contact),
-        #   • gripper is closed enough, and
-        #   • EE is close enough to the object.
-        # The counter resets if any condition breaks.
-        was_locked = self._gripper_locked
+        # ── Auto-grasp trigger: distance-only ────────────────────────────────
+        # Phase A gripper is open (21 cm span) — it physically cannot contact a
+        # 7 cm bottle from the side.  We trigger purely on EE proximity, then
+        # auto-close and attach a rigid pybullet constraint so the object follows
+        # the EE regardless of friction (standard sim grasping workaround).
+        gripper_contact = self._gripper_contact()  # used in obs & reward only
         if not self._gripper_locked:
-            close_cmd = action_cmd[5] < -0.2
-            if close_cmd:
-                self._close_confirm += 1
-            else:
-                self._close_confirm = 0
-
-            lock_geometry_ok = (
-                dist < self.GRASP_DIST
-                and pre_xy_err < self.LOCK_LATERAL_THRESH
-                and uprightness > self.UPRIGHT_LOCK_MIN
-                and obj_xy_disp < self.LOCK_XY_PUSH_THRESH
-            )
-            if (
-                bilateral_contact
-                and gripper_angle < self.GRASP_CLOSE_THRESH
-                and self._close_confirm >= self.CLOSE_CONFIRM_STEPS
-                and lock_geometry_ok
-            ):
+            if dist < self.GRASP_DIST:
                 self._grasp_confirm += 1
-                if self._grasp_confirm >= self.GRASP_CONFIRM_STEPS:
-                    self._gripper_locked  = True
-                    self._lock_obj_above  = obj_above   # snapshot for lift verification
+                if self._grasp_confirm >= self.GRASP_CONFIRM:
+                    self._gripper_locked = True
+                    self._lock_obj_above = obj_above
+                    # Attach object to EE with a fixed constraint.
+                    ee_pos, ee_quat = self.robot.get_link_pos_orient(
+                        self.robot.end_effector
+                    )
+                    obj_pos_c, obj_quat_c = self.object.get_base_pos_orient()
+                    inv_ee_pos, inv_ee_quat = p.invertTransform(ee_pos, ee_quat)
+                    rel_pos, rel_quat = p.multiplyTransforms(
+                        inv_ee_pos, inv_ee_quat, obj_pos_c, obj_quat_c,
+                        physicsClientId=self.env.id,
+                    )
+                    self._grasp_constraint = p.createConstraint(
+                        self.robot.body,          # parentBodyUniqueId
+                        self.robot.end_effector,  # parentLinkIndex
+                        self.object.body,         # childBodyUniqueId
+                        -1,                       # childLinkIndex (base)
+                        p.JOINT_FIXED,            # jointType
+                        [0, 0, 0],               # jointAxis
+                        list(rel_pos),            # parentFramePosition
+                        [0, 0, 0],               # childFramePosition
+                        list(rel_quat),           # parentFrameOrientation
+                        physicsClientId=self.env.id,
+                    )
+                    # maxForce: must support object weight (4.9 N) + lift dynamics.
+                    # Using 50 N gives ~10× margin without destabilising the arm.
+                    p.changeConstraint(
+                        self._grasp_constraint,
+                        maxForce=50,
+                        physicsClientId=self.env.id,
+                    )
             else:
                 self._grasp_confirm = 0
 
+        # ── Phase C transition: lift target reached ───────────────────────────
+        if self._gripper_locked and not self._phase_c and obj_above >= self.LIFT_TARGET_M:
+            self._phase_c = True
+            # Stage 1: lifting to target height = success → end episode here.
+            if self._curriculum_stage == 1 and not self._success_rewarded:
+                self._success_rewarded = True
+
+        # ── Phase C transitions and release ───────────────────────────────────
+        placed = False
+        if self._phase_c and not self._success_rewarded:
+            # C1 → C2: start controlled descent once EE is above the target
+            if not self._place_descend and place_dist < self.PLACE_DIST:
+                self._place_descend = True
+
+            # C2 release: object is close enough to table → gentle placement
+            if self._place_descend and obj_above < self.PLACE_HEIGHT_M:
+                if self._grasp_constraint >= 0:
+                    p.removeConstraint(
+                        self._grasp_constraint, physicsClientId=self.env.id
+                    )
+                    self._grasp_constraint = -1
+                # Brief settle so object rests on the table
+                m.step_simulation(steps=15, realtime=self.env.render)
+                placed = True
+                self._success_rewarded = True
+
         # ── Reward ────────────────────────────────────────────────────────────
-        false_grasp   = False   # set to True in Phase B if lift verification fails
-        quality_score = 0.0     # continuous hold-quality (Phase B only; 0 in Phase A)
+        false_grasp = False
 
         if not self._gripper_locked:
-            # Phase A ── dense reach + contact + close-gripper shaping.
+            # Phase A: dense potential-based approach reward.
+            r_reach = float(np.clip((self._prev_dist - dist) * 10.0, -2.0, 2.0))
+            reward_phase = r_reach
 
-            # Pregrasp shaping: reward geometric approach (lateral/height/yaw),
-            # not just center distance.
-            r_reach = float(np.clip((self._prev_reach_metric - reach_now) * 20.0, -2.0, 2.0))
-
-            # One-time bonus the first time gripper fingers contact the object.
-            # Using a single event reward rather than a per-step bonus avoids the
-            # exploit of "rub against the object for free points every step".
-            if gripper_contact and not self._contact_rewarded:
-                r_contact = 2.0
-                self._contact_rewarded = True
-            else:
-                r_contact = 0.0
-
-            # Reward closing the gripper, but ONLY when bilateral contact already
-            # holds — i.e. the gripper already spans the object on both sides.
-            # Gating on distance alone caused premature closing: the policy would
-            # rush within 0.24 m and immediately squeeze, making it harder to
-            # subsequently insert the open fingers around the bottle body.
-            # Gating on bilateral_contact ensures the "position first, close second"
-            # ordering is explicitly rewarded.
-            if bilateral_contact:
-                r_close = float(np.clip(
-                    (self.GRIPPER_OPEN - gripper_angle) / self.GRIPPER_OPEN, 0.0, 1.0
-                )) * 2.0
-            else:
-                r_close = 0.0
-
-            reward_phase = r_reach + r_contact + r_close
-
-        else:
-            # Phase B ── settle → hold → lift.
-            r_reach = 0.0
+        elif not self._phase_c:
+            # Phase B: lift reward.
             self._locked_steps += 1
+            delta_z = obj_above - self._prev_obj_above
+            r_lift  = float(np.clip(delta_z * 20.0, -2.0, 2.0))
 
-            # Lock bonus spread evenly over SETTLE_STEPS rather than fired as a
-            # single step spike.  Total credit is identical (R_GRASP_BONUS) but the
-            # value surface is much smoother: the critic can fit a gradual ramp
-            # instead of a single-step discontinuity.
-            r_grasp = (
-                self.R_GRASP_BONUS / float(self.SETTLE_STEPS)
-                if self._locked_steps <= self.SETTLE_STEPS else 0.0
+            r_height = (
+                0.3 * float(np.clip(obj_above / self.LIFT_TARGET_M, 0.0, 1.0))
+                if obj_above >= 0.02 else 0.0
             )
 
-            # Continuous hold-quality score via geometric mean of four normalised
-            # components.  Each is in [0, 1]; the product is 1 only when all
-            # dimensions are simultaneously perfect, and drops smoothly toward 0
-            # as any single dimension degrades.  This replaces the hard three-tier
-            # (+1 / -0.5 / -1) logic that created gradient cliffs at threshold edges.
-            obj_ee_lateral = float(abs(obj_in_ee[1]))
-            if bilateral_contact:
-                upright_q = float(np.clip(
-                    (uprightness - self.UPRIGHT_LOCK_MIN) / (1.0 - self.UPRIGHT_LOCK_MIN),
-                    0.0, 1.0,
-                ))
-                lateral_q = float(np.clip(
-                    1.0 - obj_ee_lateral / self.OBJ_EE_LAT_THRESH, 0.0, 1.0,
-                ))
-                # Lower gripper_angle = more closed = better enclosure, up to GRIP_ENCLOSE_MIN.
-                # Score is 1.0 when angle == GRIP_ENCLOSE_MIN (tightest valid hold),
-                # 0.0 when angle == GRASP_CLOSE_THRESH (barely meets lock threshold).
-                enclose_q = float(np.clip(
-                    (self.GRASP_CLOSE_THRESH - gripper_angle)
-                    / max(self.GRASP_CLOSE_THRESH - self.GRIP_ENCLOSE_MIN, 1e-6),
-                    0.0, 1.0,
-                ))
-                center_q = float(np.clip(
-                    1.0 - pre_xy_err / (self.LOCK_LATERAL_THRESH * 1.5), 0.0, 1.0,
-                ))
-                # Geometric mean: all four components must be high for a good score.
-                quality_score = float(
-                    np.sqrt(np.sqrt(upright_q * lateral_q * enclose_q * center_q))
-                )
-                r_hold_quality = 2.0 * quality_score - 1.0   # maps [0,1] → [-1,+1]
-            else:
-                quality_score  = 0.0
-                r_hold_quality = -1.0
-
-            # hold_ok gates r_lift weighting (structural, not reward).
-            hold_ok = quality_score > 0.3
-            if hold_ok:
-                self._hold_stable_steps += 1
-            else:
-                self._hold_stable_steps = 0
-
-            # r_lift: three-phase.
-            #   SETTLE_STEPS:        0     — let grasp settle, no upward pressure.
-            #   hold not stable:     0.3×  — weak gradient only.
-            #   hold stable:         full  — differential reward.
-            delta_lift = obj_above - self._prev_obj_above
-            r_lift_raw = float(np.clip(delta_lift * 25.0, -2.0, 2.0))
-            if self._locked_steps <= self.SETTLE_STEPS:
-                r_lift = 0.0
-            elif self._hold_stable_steps >= self.HOLD_STABLE_STEPS:
-                r_lift = r_lift_raw
-            else:
-                r_lift = 0.3 * r_lift_raw
-
-            # Per-step height-hold bonus: rewards *being* at height, complementing
-            # the delta-based r_lift.  This gives a stable positive gradient even
-            # when hovering at a fixed height, so the policy is not only driven to
-            # produce upward jitter.  Scales linearly with obj_above / LIFT_TARGET_M
-            # so higher is always strictly better.
-            if self._hold_stable_steps >= self.HOLD_STABLE_STEPS and obj_above >= self.HEIGHT_HOLD_THRESH:
-                r_height_hold = self.HEIGHT_HOLD_BONUS * float(
-                    np.clip(obj_above / self.LIFT_TARGET_M, 0.0, 1.0)
-                )
-            else:
-                r_height_hold = 0.0
-
-            # r_pose_stable fades to zero over POSE_STABLE_WINDOW so normal lifting
-            # motion is never penalised.
-            rel_obj = np.array(obj_pos, dtype=np.float32) - np.array(ee_pos, dtype=np.float32)
-            rel_delta = float(np.linalg.norm(rel_obj - self._prev_rel_obj))
-            if self._locked_steps <= self.POSE_STABLE_WINDOW:
-                pose_weight = 1.0 - (self._locked_steps - 1) / float(self.POSE_STABLE_WINDOW)
-                r_pose_stable = -float(np.clip(rel_delta * 15.0, 0.0, 1.0)) * pose_weight
-            else:
-                r_pose_stable = 0.0
-
-            # Escalating failure penalty kicks in only after the grace window.
-            steps_past_grace = max(0, self._locked_steps - self.LOCK_GRACE_STEPS)
-            r_fail = -float(min(steps_past_grace * self.LOCK_PENALTY_RATE, 2.0))
-
-            # False-grasp detection: episode ends with -20 penalty if the object
-            # has not risen LIFT_VERIFY_MIN within LIFT_VERIFY_WINDOW steps.
-            if self._locked_steps == self.LIFT_VERIFY_WINDOW:
+            if self._locked_steps == self.LIFT_VERIFY_WIN:
                 rise = obj_above - self._lock_obj_above
                 if rise < self.LIFT_VERIFY_MIN:
-                    r_verify_fail = -20.0
-                    false_grasp   = True
+                    r_false   = -10.0
+                    false_grasp = True
                 else:
-                    r_verify_fail = 0.0
+                    r_false = 0.0
             else:
-                r_verify_fail = 0.0
+                r_false = 0.0
 
-            # One-time sparse success bonus.
-            if obj_above >= self.LIFT_TARGET_M and not self._success_rewarded:
-                r_success = 100.0
-                self._success_rewarded = True
+            # One-time bonus / success reward when entering Phase C (lift succeeded).
+            # Stage 1: treat lift completion as full task success (same reward as
+            # PLACE_SUCCESS so reward scales are comparable across ablation stages).
+            if self._phase_c and not self._lift_done_rewarded:
+                if self._curriculum_stage == 1:
+                    r_lift_done = self.PLACE_SUCCESS   # terminal success reward
+                else:
+                    r_lift_done = self.LIFT_DONE_BONUS
+                self._lift_done_rewarded = True
             else:
-                r_success = 0.0
+                r_lift_done = 0.0
 
-            reward_phase = (
-                r_grasp + r_hold_quality + r_lift + r_height_hold + r_pose_stable +
-                r_fail + r_verify_fail + r_success
-            )
+            reward_phase = r_lift + r_height + r_false + r_lift_done
 
-        r_step = -0.05
-
-        tilt_excess = max(0.0, tilt_rad - self.TILT_FREE_RAD)
-        r_tilt_pen  = -self.TILT_PENALTY_SCALE * tilt_excess
-
-        # Push penalty decays once the object is clearly off the table (lifted phase).
-        # Before lock or while near table: full penalty.
-        # After lock and rising: penalty fades to zero as obj_above → LIFT_TARGET_M.
-        if self._gripper_locked and obj_above > self.LIFT_CLEAR_H:
-            push_decay = max(
-                0.0,
-                1.0 - (obj_above - self.LIFT_CLEAR_H) / (self.LIFT_TARGET_M - self.LIFT_CLEAR_H),
-            )
-            r_push_pen = -self.XY_PUSH_PENALTY_SCALE * obj_xy_disp * push_decay
         else:
-            r_push_pen = -self.XY_PUSH_PENALTY_SCALE * obj_xy_disp
+            if not self._place_descend:
+                # Phase C1: reward lateral approach to placement target.
+                r_transport = float(np.clip(
+                    (self._prev_place_dist - place_dist) * 10.0, -2.0, 2.0
+                ))
+                reward_phase = r_transport
+            else:
+                # Phase C2: reward controlled descent (object lowering).
+                r_descend = float(np.clip(
+                    (self._prev_obj_above - obj_above) * 10.0, -2.0, 2.0
+                ))
+                r_place_done = self.PLACE_SUCCESS if placed else 0.0
+                reward_phase = r_descend + r_place_done
 
-        r_action_mag = -self.ACTION_MAG_PENALTY * float(np.sum(np.square(action_cmd[:5])))
-        # General delta penalty for all 5 controllable dims.
-        r_action_delta = -self.ACTION_DELTA_PENALTY * float(np.sum(np.square(clipped_delta[:5])))
-        # Extra z-axis delta penalty to specifically suppress up/down hunting.
-        r_action_delta_z = -self.ACTION_DELTA_Z_PENALTY * float(clipped_delta[2] ** 2)
+        r_step   = -0.02
+        r_action = -0.005 * float(np.sum(np.square(action_cmd)))
+        tilt_excess = max(0.0, tilt_rad - self.TILT_FREE_RAD)
+        r_tilt = -self.TILT_PENALTY_SCALE * tilt_excess
 
-        reward = (
-            reward_phase + r_step
-            + r_tilt_pen + r_push_pen
-            + r_action_mag + r_action_delta + r_action_delta_z
-        )
+        reward = reward_phase + r_step + r_action + r_tilt
 
-        # Update potentials for next step.
-        self._prev_dist      = dist
-        self._prev_obj_above = obj_above
-        self._prev_reach_metric = reach_now
-        self._prev_action    = action_cmd
-        self._prev_rel_obj   = np.array(obj_pos, dtype=np.float32) - np.array(ee_pos, dtype=np.float32)
+        # ── Update potentials ─────────────────────────────────────────────────
+        self._prev_dist       = dist
+        self._prev_obj_above  = obj_above
+        self._prev_place_dist = place_dist
+        self._prev_action     = action_cmd
 
-        # Terminate when success is confirmed OR a false-grasp is detected.
-        # False-grasp termination (terminated=True, not truncated) gives the
-        # value network a clear -20 terminal signal rather than bootstrapping
-        # from a hopeless stall.
         terminated = self._success_rewarded or false_grasp
         truncated  = False
 
-        # ── Info ──────────────────────────────────────────────────────────────
         self._step_info = {
-            'dist':                dist,
-            'reach_metric':        reach_now,
-            'pre_xy_err':          pre_xy_err,
-            'pre_z_err':           pre_z_err,
-            'pre_yaw_err':         pre_yaw_err,
-            'gripper_contact':     1.0 if gripper_contact else 0.0,
-            'bilateral_contact':   1.0 if bilateral_contact else 0.0,
-            'gripper_angle':       gripper_angle,
-            'obj_ee_lateral':      float(abs(obj_in_ee[1])),
-            'hold_quality_score':  quality_score if self._gripper_locked else 0.0,
-            'grasp_confirm':       float(self._grasp_confirm),
-            'close_confirm':       float(self._close_confirm),
-            'grasp_confirm_frac':  float(self._grasp_confirm) / float(self.GRASP_CONFIRM_STEPS),
-            'gripper_locked':      float(self._gripper_locked),
-            'locked_steps':        float(self._locked_steps),
-            'hold_stable_steps':   float(self._hold_stable_steps),
-            'uprightness':         uprightness,
-            'obj_xy_disp_m':       obj_xy_disp,
-            'obj_lift_m':          obj_above,
-            'speed_factor':        speed_factor,
-            'false_grasp':         1.0 if false_grasp else 0.0,
-            'success':             float(self._success_rewarded),
+            'dist':           dist,
+            'place_dist':     place_dist,
+            'obj_lift_m':     obj_above,
+            'gripper_contact':float(gripper_contact),
+            'gripper_locked': float(self._gripper_locked),
+            'phase_c':        float(self._phase_c),
+            'place_descend':  float(self._place_descend),
+            'locked_steps':   float(self._locked_steps),
+            'confirm':        float(self._grasp_confirm),
+            'speed_factor':   speed_factor,
+            'false_grasp':    1.0 if false_grasp else 0.0,
+            'placed':         1.0 if placed else 0.0,
+            'success':        float(self._success_rewarded),
         }
 
         return self._get_obs(), reward, terminated, truncated, self._get_info()
 
 
-gym.register(id='GraspEnv', entry_point=GraspEnv, max_episode_steps=300)
+gym.register(id='GraspEnv',       entry_point=GraspEnv, max_episode_steps=500)
+# Ablation stages: same env class, different curriculum_stage value.
+# Stage 1 – Phase A+B only (grasp + lift).  Shorter horizon → fewer max steps.
+gym.register(id='GraspEnvStage1', entry_point=GraspEnv,
+             kwargs={'curriculum_stage': 1}, max_episode_steps=300)
+# Stage 2 – Phase C only (transport + place).  Starts pre-grasped.
+gym.register(id='GraspEnvStage2', entry_point=GraspEnv,
+             kwargs={'curriculum_stage': 2}, max_episode_steps=400)
