@@ -13,8 +13,8 @@ Usage:
     # Custom run name / W&B project
     conda run -n 16762 python train_grasp.py --stage full --project 16762-robot-rl --name MyRun
 
-    # Extra options
-    conda run -n 16762 python train_grasp.py --stage 1 --save-every 20 --record-video
+    # Disable video upload (video is on by default)
+    conda run -n 16762 python train_grasp.py --stage 1 --no-video
 
 Dependencies (install once):
     pip install wandb
@@ -369,10 +369,10 @@ def parse_args():
     p.add_argument('--seed',     type=int, default=0)
     p.add_argument('--save-every', type=int, default=10,
                    help='Save a dated checkpoint snapshot every N epochs (default: 10)')
-    p.add_argument('--record-video', action='store_true',
-                   help='Upload an evaluation video to W&B periodically')
+    p.add_argument('--no-video', action='store_true',
+                   help='Disable automatic W&B video upload (video is on by default)')
     p.add_argument('--video-every', type=int, default=10,
-                   help='Upload video every N epochs when --record-video is set (default: 10)')
+                   help='Upload video every N epochs (default: 10)')
     p.add_argument(
         '--stage',
         choices=['1', '2', 'full'],
@@ -496,7 +496,8 @@ def main():
         .with_epoch_train_callback(_make_train_callback(args, ckpt_dir))
     )
 
-    if args.record_video:
+    record_video = not args.no_video
+    if record_video:
         builder = builder.with_epoch_test_callback(
             VideoLogCallback(every_n=args.video_every)
         )
@@ -517,7 +518,7 @@ def main():
     print(f"  max epochs     : {max_epochs}")
     print(f"  gamma          : {PPO_PARAMS.gamma}  ent_coef: {PPO_PARAMS.ent_coef}")
     print(f"  snapshot every {args.save_every} epochs → {ckpt_dir}")
-    print(f"  video logging  : {'on (every %d epochs)' % args.video_every if args.record_video else 'off'}")
+    print(f"  video logging  : {'on (every %d epochs)' % args.video_every if record_video else 'off (--no-video)'}")
     if args.load_from:
         what = 'actor+critic' if args.load_actor_critic else 'actor only'
         print(f"  warm-start from: {args.load_from}  [{what}]")
