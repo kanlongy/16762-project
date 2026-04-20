@@ -14,8 +14,12 @@ class GraspEnv(gym.Env):
     The gripper is fully automatic — the policy only moves the robot to a good
     position.  Once the end-effector stays within GRASP_DIST of the object for
     GRASP_CONFIRM steps the gripper closes automatically (Phase A → Phase B).
-    After locking the lift joint is driven upward at a fixed rate; the policy
-    may still adjust base and wrist for balance.
+    After locking, wrist pitch and roll are held at 0 (so the gripper stays
+    horizontal and the grasped object cannot tilt or fall out), but base yaw
+    and wrist yaw remain free so the policy can reorient the robot toward the
+    placement target during transport.  In Phase B the lift joint is driven
+    upward at a fixed rate; in Phase C2 it is driven downward for a gentle
+    placement.
 
     Observation (21 dims):
         ee_local        (3)  – EE (fingertip midpoint) position in robot base frame
@@ -31,10 +35,11 @@ class GraspEnv(gym.Env):
         ── total: 3+3+3+3+1+1+1+1+5 = 21 ──
 
     Action (5 dims, all in [-1, 1]):
-        [0:2]  base wheel velocities
-        [2]    lift joint delta  (auto-lift in Phase B; free in Phase A/C)
+        [0:2]  base wheel velocities  (right, left)
+        [2]    lift joint delta  (auto-lift in Phase B; auto-descend in C2;
+                                  free in Phase A / C1)
         [3]    arm extension delta
-        [4]    wrist yaw delta
+        [4]    wrist yaw delta    (wrist pitch/roll are hard-locked to 0)
 
     Phase flow:
         A (approach)  – !gripper_locked
@@ -100,7 +105,7 @@ class GraspEnv(gym.Env):
     PLACE_MAX_DIST   = 0.40    # max lateral distance of place_target from pickup
 
     # Friction coefficients applied at reset (pybullet changeDynamics).
-    # Default PyBullet friction (~0.5) is far too low to hold a 0.5 kg bottle.
+    # Default PyBullet friction (~0.5) is low relative to the object weight.
     OBJ_LATERAL_FRICTION  = 3.0
     OBJ_SPINNING_FRICTION = 0.5
     OBJ_ROLLING_FRICTION  = 0.1
@@ -133,12 +138,15 @@ class GraspEnv(gym.Env):
 
     # controllable_joints = [0, 1, 4, 6, 7, 8, 9, 10, 12, 13, 26, 29]
     # indices:               0  1  2  3  4  5  6   7   8   9  10  11
-    _IDX_LIFT      = 2
-    _IDX_ARM_START = 3
-    _IDX_ARM_END   = 7
-    _IDX_WRIST     = slice(7, 10)
-    _IDX_GRIP_L    = 10
-    _IDX_GRIP_R    = 11
+    _IDX_LIFT       = 2
+    _IDX_ARM_START  = 3
+    _IDX_ARM_END    = 7
+    _IDX_WRIST      = slice(7, 10)
+    _IDX_WRIST_YAW  = 7
+    _IDX_WRIST_PITCH = 8
+    _IDX_WRIST_ROLL  = 9
+    _IDX_GRIP_L     = 10
+    _IDX_GRIP_R     = 11
 
     _CAM_EYE    = [0.8, -1.5, 1.6]
     _CAM_TARGET = [-0.6, 0.0, 0.85]
@@ -446,9 +454,18 @@ class GraspEnv(gym.Env):
             position=[-1.3, 0, height_offset],
             orientation=[0, 0, 0, 1],
         )
+        # Object mass: 0.15 kg (previously 0.5 kg).
+        # The mustard-bottle mesh is ~23 cm out from the wrist_pitch axis, so
+        # every 100 g of object weight translates into ~0.23 N·m of gravitational
+        # torque on the wrist. With mengine's soft default PD gains (0.05) and
+        # the whole robot arm overridden to 10 g per link in stretch3.py, a
+        # 0.5 kg bottle visibly tilts the gripper during lift + transport. 0.15
+        # kg keeps the task meaningful (still heavier than the entire wrist +
+        # gripper linkage) while staying well inside the PD controller's
+        # stable operating range.
         self.object = m.Shape(
             m.Mesh(filename=os.path.join(m.directory, 'ycb', 'mustard.obj'), scale=[1, 1, 1]),
-            static=False, mass=0.5,
+            static=False, mass=0.15,
             position=[
                 -0.6 - np.random.uniform(0.0, 0.2),
                 np.random.uniform(-0.2, 0.2),
@@ -471,9 +488,11 @@ class GraspEnv(gym.Env):
             [self.GRIPPER_OPEN, self.GRIPPER_OPEN], set_instantly=True
         )
 
-        # Boost friction so the gripper can hold the 0.5 kg bottle.
-        # PyBullet default (~0.5) produces only ~0.1 N friction — far below
-        # the 4.9 N needed to support the bottle weight.
+        # Boost friction so the gripper can hold the 0.15 kg bottle without
+        # relying entirely on the grasp constraint. PyBullet default (~0.5)
+        # produces less finger friction than the bottle's ~1.5 N weight needs
+        # when only a finger-object contact is available (edge of constraint
+        # cone, low normal force transients, etc.).
         p.changeDynamics(
             self.object.body, -1,
             lateralFriction=self.OBJ_LATERAL_FRICTION,
@@ -534,6 +553,15 @@ class GraspEnv(gym.Env):
         # Gripper: always open in Phase A, always closed in Phase B.
         grip_target = self.GRIPPER_CLOSE if self._gripper_locked else self.GRIPPER_OPEN
 
+        # Note on gripper uprightness during lift/transport: the two rotational
+        # DOFs that could tilt the gripper (wrist pitch, wrist roll) are already
+        # hard-locked to 0 below in `scaled` (see the [..., 0.0, 0.0] slots).
+        # The remaining rotations accessible to the policy — base yaw (differential
+        # wheels) and wrist yaw — are rotations about the vertical axis and
+        # therefore cannot tilt the gripper or cause the grasped object to fall
+        # over. We intentionally leave those free so the policy can reorient the
+        # base toward the placement target during Phase C transport.
+
         # Phase B:  auto-lift  (override lift action upward)
         # Phase C2: auto-descend (override lift action downward for gentle placement)
         # Phase C1: lift is free (policy maintains height during lateral transport)
@@ -556,7 +584,7 @@ class GraspEnv(gym.Env):
             action_cmd[0:2] * 0.5 * speed_factor,
             [action_cmd[2] * scale],
             [action_cmd[3] / 4.0 * scale] * 4,
-            [action_cmd[4] * scale, 0.0, 0.0],  # yaw only; pitch/roll locked
+            [action_cmd[4] * scale, 0.0, 0.0],  # wrist yaw only; pitch/roll locked
             [grip_target, grip_target],
         ])
 
@@ -564,6 +592,16 @@ class GraspEnv(gym.Env):
         target  = current + scaled
         target[self._IDX_GRIP_L] = grip_target
         target[self._IDX_GRIP_R] = grip_target
+
+        # Absolute-lock wrist pitch and roll to 0 (rather than "current + 0 delta").
+        # Using `current + 0` is a *follower* lock: once gravity drags the joint
+        # by Δθ, the target becomes current+Δθ and the drift is accepted as the
+        # new setpoint, so the gripper tilts progressively under the load of the
+        # grasped object. Writing absolute 0 here makes the PD controller push
+        # the joint back to horizontal every step, keeping the gripper level
+        # regardless of the object weight.
+        target[self._IDX_WRIST_PITCH] = 0.0
+        target[self._IDX_WRIST_ROLL]  = 0.0
 
         self.robot.control(target)
         m.step_simulation(steps=10, realtime=self.env.render)
@@ -624,8 +662,9 @@ class GraspEnv(gym.Env):
                         list(rel_quat),           # parentFrameOrientation
                         physicsClientId=self.env.id,
                     )
-                    # maxForce: must support object weight (4.9 N) + lift dynamics.
-                    # Using 50 N gives ~10× margin without destabilising the arm.
+                    # maxForce: must support object weight (~1.5 N for 0.15 kg)
+                    # plus transient inertial loads during lift/transport.  50 N
+                    # gives a large margin without destabilising the arm's PD.
                     p.changeConstraint(
                         self._grasp_constraint,
                         maxForce=50,
