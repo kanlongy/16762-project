@@ -58,7 +58,7 @@ def main():
     print(f"Loading checkpoint: {ckpt}")
 
     render_mode = None if args.no_render else 'human'
-    env  = gym.make('GraspEnv', render_mode=render_mode)
+    env  = gym.make('GraspEnvStage1', render_mode=render_mode)
     venv = DummyVectorEnv([lambda: env])
 
     data = torch.load(ckpt, weights_only=False, map_location='cpu')
